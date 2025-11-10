@@ -30,7 +30,7 @@ fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
     event_loop::init_pymodule(module)?;
     handles::init_pymodule(module)?;
     server::init_pymodule(module)?;
-    // ssl::init_pymodule(module)?; // TODO: SSL implementation needs more work
+    ssl::init_pymodule(module)?;
 
     Ok(())
 }

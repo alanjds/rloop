@@ -417,11 +417,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         rsock = (sock.fileno(), sock.family)
         sock.detach()
 
-        # TODO
         if ssl:
-            raise NotImplementedError
-
-        transport, protocol = self._tcp_conn(rsock, protocol_factory)
+            transport, protocol = self._ssl_conn(rsock, protocol_factory, server_hostname, ssl)
+        else:
+            transport, protocol = self._tcp_conn(rsock, protocol_factory)
 
         return transport, protocol
 
