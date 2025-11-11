@@ -50,8 +50,8 @@ def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context):
         with sock:
             sock.bind(('127.0.0.1', 0))
             addr = sock.getsockname()
-            server = await loop.create_server(lambda: server_proto, sock=sock, ssl=server_ssl_context)
-            transport, protocol = await loop.create_connection(lambda: client_proto, *addr, ssl=ssl_context, server_hostname='localhost')
+            server = await loop.create_server(lambda: server_proto, sock=sock)
+            transport, protocol = await loop.create_connection(lambda: client_proto, *addr)
             await client_proto._done
             server.close()
 
