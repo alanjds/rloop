@@ -232,7 +232,6 @@ impl EventLoop {
     ) {
         if let Source::TCPListener(listener) = &handle.source {
             let guard_poll = self.io.lock().unwrap();
-            let transports = self.tcp_transports.pin();
             let streams = self.tcp_lstreams.pin();
             let lstreams = streams.get(&handle.server.fd).unwrap().pin();
             while let Ok((stream, _)) = listener.accept() {
@@ -241,10 +240,19 @@ impl EventLoop {
                 #[allow(clippy::cast_possible_wrap)]
                 let mut source = Source::FD(fd as i32);
                 let (pytransport, stream_handle) = handle.server.new_stream(py, stream);
-                transports.insert(fd, pytransport);
+                if handle.server.ssl_context.is_some() {
+                    let bound = pytransport.bind(py);
+                    let ssl_transport = bound.downcast::<SSLTransport>().unwrap().clone().unbind();
+                    self.ssl_transports.pin().insert(fd, ssl_transport);
+                    io_handles.insert(Token(fd), IOHandle::SSLStream(Interest::READABLE));
+                } else {
+                    let bound = pytransport.bind(py);
+                    let tcp_transport = bound.downcast::<TCPTransport>().unwrap().clone().unbind();
+                    self.tcp_transports.pin().insert(fd, tcp_transport);
+                    io_handles.insert(Token(fd), IOHandle::TCPStream(Interest::READABLE));
+                }
                 lstreams.insert(fd);
                 _ = guard_poll.registry().register(&mut source, token, Interest::READABLE);
-                io_handles.insert(Token(fd), IOHandle::TCPStream(Interest::READABLE));
                 handles.push_back(stream_handle);
             }
             return;

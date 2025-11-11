@@ -184,7 +184,7 @@ pub(crate) struct SSLTransport {
     water_lo: atomic::AtomicUsize,
     weof: atomic::AtomicBool,
     // py protocol fields
-    proto: Py<PyAny>,
+    pub proto: Py<PyAny>,
     proto_buffered: bool,
     proto_paused: atomic::AtomicBool,
     protom_buf_get: Py<PyAny>,
