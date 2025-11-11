@@ -1,13 +1,33 @@
 import asyncio
 import socket
+import ssl
 
 import pytest
-from conftest import SSLEchoClientProtocol, SSLEchoServerProtocol
 
 import rloop
 
+from . import SSLEchoClientProtocol, SSLEchoServerProtocol
+
 
 pytestmark = [pytest.mark.timeout(5)]
+
+
+@pytest.fixture
+def ssl_context():
+    """Create a basic SSL context for testing."""
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    # For testing, we'll use a self-signed certificate
+    # In a real application, you'd load proper certificates
+    return ctx
+
+
+@pytest.fixture
+def server_ssl_context():
+    """Create an SSL context for the server."""
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    # For testing, we'll use a self-signed certificate
+    # In a real application, you'd load proper certificates
+    return ctx
 
 
 EVENT_LOOPS = [
@@ -16,7 +36,7 @@ EVENT_LOOPS = [
 ]
 
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-def test_ssl_connection_echo(evloop):
+def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context):
     """Test basic SSL connection with echo server."""
     loop = evloop()
 
@@ -30,11 +50,8 @@ def test_ssl_connection_echo(evloop):
         with sock:
             sock.bind(('127.0.0.1', 0))
             addr = sock.getsockname()
-            # For now, we'll skip SSL testing until the implementation is complete
-            # server = await loop.create_server(lambda: server_proto, sock=sock, ssl=server_ssl_context)
-            server = await loop.create_server(lambda: server_proto, sock=sock)
-            # transport, protocol = await loop.create_connection(lambda: client_proto, *addr, ssl=ssl_context, server_hostname='localhost')
-            transport, protocol = await loop.create_connection(lambda: client_proto, *addr)
+            server = await loop.create_server(lambda: server_proto, sock=sock, ssl=server_ssl_context)
+            transport, protocol = await loop.create_connection(lambda: client_proto, *addr, ssl=ssl_context, server_hostname='localhost')
             await client_proto._done
             server.close()
 

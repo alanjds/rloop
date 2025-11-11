@@ -29,6 +29,7 @@ pub(crate) struct TCPServer {
     sfamily: i32,
     backlog: i32,
     protocol_factory: Py<PyAny>,
+    ssl_context: Option<Py<PyAny>>,
 }
 
 impl TCPServer {
@@ -38,6 +39,17 @@ impl TCPServer {
             sfamily,
             backlog,
             protocol_factory,
+            ssl_context: None,
+        }
+    }
+
+    pub(crate) fn from_fd_ssl(fd: i32, sfamily: i32, backlog: i32, protocol_factory: Py<PyAny>, ssl_context: Py<PyAny>) -> Self {
+        Self {
+            fd,
+            sfamily,
+            backlog,
+            protocol_factory,
+            ssl_context: Some(ssl_context),
         }
     }
 
@@ -52,6 +64,7 @@ impl TCPServer {
             pyloop: pyloop.clone_ref(py),
             sfamily: self.sfamily,
             proto_factory: self.protocol_factory.clone_ref(py),
+            ssl_context: self.ssl_context.as_ref().map(|ctx| ctx.clone_ref(py)),
         };
         pyloop.get().tcp_listener_add(listener, sref);
 
@@ -95,6 +108,7 @@ pub(crate) struct TCPServerRef {
     pyloop: Py<EventLoop>,
     sfamily: i32,
     proto_factory: Py<PyAny>,
+    ssl_context: Option<Py<PyAny>>,
 }
 
 impl TCPServerRef {
