@@ -72,6 +72,11 @@ def ssl_context():
 def server_ssl_context():
     """Create an SSL context for the server."""
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    # For testing, we'll use a self-signed certificate
-    # In a real application, you'd load proper certificates
+    # Load test certificates
+    import os
+    cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
+    ctx.load_cert_chain(
+        os.path.join(cert_dir, 'cert.pem'),
+        os.path.join(cert_dir, 'key.pem')
+    )
     return ctx
