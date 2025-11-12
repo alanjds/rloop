@@ -26,8 +26,14 @@ def ssl_context():
 def server_ssl_context():
     """Create an SSL context for the server."""
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    # For testing, we'll use a self-signed certificate
-    # In a real application, you'd load proper certificates
+    # For testing, load test certificates for asyncio compatibility
+    # The Rust implementation generates its own dummy certificate when no certs are loaded
+    import os
+    cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
+    # Set attributes that Rust code expects
+    ctx._certfile = os.path.join(cert_dir, 'cert.pem')
+    ctx._keyfile = os.path.join(cert_dir, 'key.pem')
+    ctx.load_cert_chain(ctx._cert_file, ctx._key_file)
     return ctx
 
 
@@ -127,9 +133,11 @@ def test_ssl_server(evloop, ssl_context, server_ssl_context):
         sock.setblocking(False)
 
         with sock:
-            sock.bind(('127.0.0.1', 0))
+            sock.bind(('localhost', 0))
             addr = sock.getsockname()
             server = await loop.create_server(lambda: server_proto, sock=sock, ssl=server_ssl_context)
+            # Give server time to start
+            await asyncio.sleep(0.01)
             transport, protocol = await loop.create_connection(lambda: client_proto, *addr, ssl=ssl_context)
             await client_proto._done
             server.close()

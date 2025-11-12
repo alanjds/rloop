@@ -52,7 +52,6 @@ class SSLEchoClientProtocol(SSLProtocol):
     def connection_made(self, transport):
         super().connection_made(transport)
         transport.write(b'hello SSL world')
-        transport.write_eof()
 
     def data_received(self, data):
         super().data_received(data)
@@ -71,7 +70,7 @@ def ssl_context():
 @pytest.fixture
 def server_ssl_context():
     """Create an SSL context for the server."""
-    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     # Load test certificates
     import os
     cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
