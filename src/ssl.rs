@@ -2,6 +2,7 @@
 use std::os::fd::{AsRawFd, FromRawFd};
 
 use anyhow::Result;
+use log::debug;
 use mio::{
     Interest,
     net::TcpStream,
@@ -713,6 +714,7 @@ impl SSLReadHandle {
 
 impl Handle for SSLReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
+        debug!("SSLReadHandle::run called for fd {}", self.fd);
         let pytransport = event_loop.get_ssl_transport(self.fd, py);
         let transport = pytransport.borrow(py);
 

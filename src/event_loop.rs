@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
+use log::debug;
 use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use pyo3::prelude::*;
 
@@ -241,6 +242,7 @@ impl EventLoop {
                 let mut source = Source::FD(fd as i32);
                 let (pytransport, stream_handle) = handle.server.new_stream(py, stream);
                 if handle.server.ssl_context.is_some() {
+                    debug!("Server accepted connection, creating SSL transport for fd {}", fd);
                     let bound = pytransport.bind(py);
                     let ssl_transport = bound.downcast::<SSLTransport>().unwrap().clone().unbind();
                     self.ssl_transports.pin().insert(fd, ssl_transport);

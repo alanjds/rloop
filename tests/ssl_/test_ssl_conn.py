@@ -33,7 +33,7 @@ def server_ssl_context():
     # Set attributes that Rust code expects
     ctx._certfile = os.path.join(cert_dir, 'cert.pem')
     ctx._keyfile = os.path.join(cert_dir, 'key.pem')
-    ctx.load_cert_chain(ctx._cert_file, ctx._key_file)
+    ctx.load_cert_chain(ctx._certfile, ctx._keyfile)
     return ctx
 
 

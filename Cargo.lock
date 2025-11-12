@@ -507,6 +507,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
+ "log",
  "mio",
  "papaya",
  "pyo3",
