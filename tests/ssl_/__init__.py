@@ -1,10 +1,14 @@
 import asyncio
+import logging
 import socket
 import ssl
 
 import pytest
 
 import rloop
+
+
+logger = logging.getLogger(__name__)
 
 
 class SSLProtocol(asyncio.Protocol):
@@ -20,11 +24,13 @@ class SSLProtocol(asyncio.Protocol):
             raise AssertionError(f'state: {self.state!r}, expected: {expected!r}')
 
     def connection_made(self, transport):
+        logger.debug(f'{self.__class__.__name__}: connection_made')
         self.transport = transport
         self._assert_state('INITIAL')
         self.state = 'CONNECTED'
 
     def data_received(self, data):
+        logger.debug(f'{self.__class__.__name__}: data_received {len(data)} bytes')
         self._assert_state('CONNECTED')
         self.data += data
 
@@ -34,6 +40,7 @@ class SSLProtocol(asyncio.Protocol):
         self.transport.close()
 
     def connection_lost(self, exc):
+        logger.debug(f'{self.__class__.__name__}: connection_lost')
         self._assert_state('CONNECTED', 'EOF')
         self.transport = None
         self.state = 'CLOSED'

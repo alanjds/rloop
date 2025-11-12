@@ -651,6 +651,12 @@ impl SSLReadHandle {
                 debug!("Error reading TLS for fd {}: {:?}", self.fd, e);
                 return Err(Box::new(e));
             }
+        };
+        debug!("Read {} bytes from TLS for fd {}", read, self.fd);
+
+        if read == 0 {
+            debug!("Read 0 bytes from TLS for fd {}, not processing", self.fd);
+            return Ok(false);
         }
 
         // Process the TLS packets
@@ -748,7 +754,9 @@ impl Handle for SSLReadHandle {
         let transport = pytransport.borrow(py);
 
         // First, try to complete handshake if needed
-        if let Err(_) = self.do_handshake(py, &transport) {
+        let handshake_result = self.do_handshake(py, &transport);
+        debug!("SSLReadHandle::run handshake_result for fd {}: {:?}", self.fd, handshake_result);
+        if let Err(_) = handshake_result {
             let err = pyo3::exceptions::PyRuntimeError::new_err("SSL handshake failed");
             transport.call_conn_lost(py, Some(err.into_pyobject(py).unwrap().into_any().unbind()));
             return;
@@ -756,6 +764,7 @@ impl Handle for SSLReadHandle {
 
         // Call connection_made if handshake just completed
         if *transport.handshake_complete.borrow() && !*transport.connection_made_called.borrow() {
+            debug!("SSLReadHandle::run calling connection_made for fd {}", self.fd);
             let pytransport = event_loop.get_ssl_transport(self.fd, py);
             _ = transport.proto.call_method1(py, pyo3::intern!(py, "connection_made"), (pytransport.clone_ref(py).into_any(),));
             *transport.connection_made_called.borrow_mut() = true;
@@ -763,6 +772,7 @@ impl Handle for SSLReadHandle {
 
         // Then try to read data
         let (data, eof) = self.recv_data(py, &transport, &mut state.read_buf);
+        debug!("SSLReadHandle::run recv_data for fd {}: data_present={}, eof={}", self.fd, data.is_some(), eof);
 
         if let Some(data) = data {
             _ = transport.protom_recv_data.call1(py, (data,));

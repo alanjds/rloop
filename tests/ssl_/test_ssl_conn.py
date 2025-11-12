@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import socket
 import ssl
 
@@ -7,6 +8,9 @@ import pytest
 import rloop
 
 from . import SSLEchoClientProtocol, SSLEchoServerProtocol
+
+
+logging.basicConfig(level=logging.DEBUG)
 
 
 pytestmark = [pytest.mark.timeout(5)]

@@ -25,6 +25,9 @@ pub(crate) fn get_lib_version() -> &'static str {
 
 #[pymodule(gil_used = false)]
 fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
+    // Initialize logging
+    env_logger::init();
+
     // Initialize rustls crypto provider
     rustls::crypto::ring::default_provider()
         .install_default()
