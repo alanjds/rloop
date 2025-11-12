@@ -137,7 +137,7 @@ def test_ssl_server(evloop, ssl_context, server_ssl_context):
         sock.setblocking(False)
 
         with sock:
-            sock.bind(('localhost', 0))
+            sock.bind(('127.0.0.1', 0))
             addr = sock.getsockname()
             server = await loop.create_server(lambda: server_proto, sock=sock, ssl=server_ssl_context)
             # Give server time to start

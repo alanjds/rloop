@@ -8,7 +8,7 @@ mod log;
 mod py;
 mod server;
 mod sock;
-mod ssl;
+// mod ssl;
 mod tcp;
 mod time;
 mod udp;
@@ -28,17 +28,12 @@ fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
     // Initialize logging
     env_logger::init();
 
-    // Initialize rustls crypto provider
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
-
     module.add("__version__", get_lib_version())?;
 
     event_loop::init_pymodule(module)?;
     handles::init_pymodule(module)?;
     server::init_pymodule(module)?;
-    ssl::init_pymodule(module)?;
+    // ssl::init_pymodule(module)?;
 
     Ok(())
 }
