@@ -25,6 +25,11 @@ pub(crate) fn get_lib_version() -> &'static str {
 
 #[pymodule(gil_used = false)]
 fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
+    // Initialize rustls crypto provider
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     module.add("__version__", get_lib_version())?;
 
     event_loop::init_pymodule(module)?;

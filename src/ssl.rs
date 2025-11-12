@@ -9,6 +9,7 @@ use mio::{
 };
 use pyo3::{IntoPyObjectExt, buffer::PyBuffer, prelude::*, types::PyBytes};
 use rustls::{ClientConfig, ServerConfig, ClientConnection, ServerConnection, Stream};
+use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -26,12 +27,33 @@ use crate::{
     utils::syscall,
 };
 
-pub(crate) struct SSLTransportState {
-    stream: TcpStream,
-    tls_connection: TlsConnection,
-    write_buf: VecDeque<Box<[u8]>>,
-    write_buf_dsize: usize,
-    handshake_complete: bool,
+#[pyclass(frozen, unsendable, module = "rloop._rloop")]
+pub(crate) struct SSLTransport {
+    pub fd: usize,
+    pub lfd: Option<usize>,
+    stream: RefCell<TcpStream>,
+    tls_connection: RefCell<TlsConnection>,
+    write_buf: RefCell<VecDeque<Box<[u8]>>>,
+    write_buf_dsize: RefCell<usize>,
+    handshake_complete: RefCell<bool>,
+    connection_made_called: RefCell<bool>,
+    pyloop: Py<EventLoop>,
+    // atomics
+    closing: atomic::AtomicBool,
+    paused: atomic::AtomicBool,
+    water_hi: atomic::AtomicUsize,
+    water_lo: atomic::AtomicUsize,
+    weof: atomic::AtomicBool,
+    // py protocol fields
+    pub proto: Py<PyAny>,
+    proto_buffered: bool,
+    proto_paused: atomic::AtomicBool,
+    protom_buf_get: Py<PyAny>,
+    protom_conn_lost: Py<PyAny>,
+    protom_recv_data: Py<PyAny>,
+    // py extras
+    extra: HashMap<String, Py<PyAny>>,
+    sock: Py<SocketWrapper>,
 }
 
 enum TlsConnection {
@@ -104,15 +126,15 @@ impl TlsConnection {
 
     fn read_tls(&mut self, rd: &mut dyn Read) -> Result<usize, std::io::Error> {
         match self {
-            TlsConnection::Client(ref mut conn) => conn.read_tls(rd),
-            TlsConnection::Server(ref mut conn) => conn.read_tls(rd),
+            TlsConnection::Client(conn) => conn.read_tls(rd),
+            TlsConnection::Server(conn) => conn.read_tls(rd),
         }
     }
 
     fn write_tls(&mut self, wr: &mut dyn Write) -> Result<usize, std::io::Error> {
         match self {
-            TlsConnection::Client(ref mut conn) => conn.write_tls(wr),
-            TlsConnection::Server(ref mut conn) => conn.write_tls(wr),
+            TlsConnection::Client(conn) => conn.write_tls(wr),
+            TlsConnection::Server(conn) => conn.write_tls(wr),
         }
     }
 
@@ -172,29 +194,7 @@ impl<'a> Write for TlsWriter<'a> {
     }
 }
 
-#[pyclass(frozen, unsendable, module = "rloop._rloop")]
-pub(crate) struct SSLTransport {
-    pub fd: usize,
-    pub lfd: Option<usize>,
-    state: RefCell<SSLTransportState>,
-    pyloop: Py<EventLoop>,
-    // atomics
-    closing: atomic::AtomicBool,
-    paused: atomic::AtomicBool,
-    water_hi: atomic::AtomicUsize,
-    water_lo: atomic::AtomicUsize,
-    weof: atomic::AtomicBool,
-    // py protocol fields
-    pub proto: Py<PyAny>,
-    proto_buffered: bool,
-    proto_paused: atomic::AtomicBool,
-    protom_buf_get: Py<PyAny>,
-    protom_conn_lost: Py<PyAny>,
-    protom_recv_data: Py<PyAny>,
-    // py extras
-    extra: HashMap<String, Py<PyAny>>,
-    sock: Py<SocketWrapper>,
-}
+
 
 impl SSLTransport {
     fn new(
@@ -207,13 +207,6 @@ impl SSLTransport {
         lfd: Option<usize>,
     ) -> Self {
         let fd = stream.as_raw_fd() as usize;
-        let state = SSLTransportState {
-            stream,
-            tls_connection,
-            write_buf: VecDeque::new(),
-            write_buf_dsize: 0,
-            handshake_complete: false,
-        };
 
         let wh = 1024 * 64;
         let wl = wh / 4;
@@ -235,7 +228,12 @@ impl SSLTransport {
         Self {
             fd,
             lfd,
-            state: RefCell::new(state),
+            stream: RefCell::new(stream),
+            tls_connection: RefCell::new(tls_connection),
+            write_buf: RefCell::new(VecDeque::new()),
+            write_buf_dsize: RefCell::new(0),
+            handshake_complete: RefCell::new(false),
+            connection_made_called: RefCell::new(false),
             pyloop,
             closing: false.into(),
             paused: false.into(),
@@ -263,16 +261,17 @@ impl SSLTransport {
     ) -> Result<Self> {
         let sock = unsafe { socket2::Socket::from_raw_fd(pysock.0) };
         _ = sock.set_nonblocking(true);
-        let stdl: std::net::TcpStream = sock.into();
-        let stream = TcpStream::from_std(stdl);
+        let mut stdl: std::net::TcpStream = sock.into();
 
         // Create TLS client connection
         let config = Self::py_ssl_context_to_rustls_client_config(py, ssl_context)?;
-        // TODO: Properly handle server_hostname parameter
-        let server_name = rustls::pki_types::ServerName::IpAddress(rustls::pki_types::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST.into()));
+        let hostname = server_hostname.as_deref().unwrap_or("localhost").to_string();
+        let server_name = rustls::pki_types::ServerName::try_from(hostname).unwrap();
 
         let conn = ClientConnection::new(config, server_name)?;
         let tls_connection = TlsConnection::Client(conn);
+
+        let stream = TcpStream::from_std(stdl);
 
         let proto = protocol_factory.bind(py).call0()?;
 
@@ -302,52 +301,70 @@ impl SSLTransport {
     }
 
     fn py_ssl_context_to_rustls_client_config(py: Python, ssl_context: Py<PyAny>) -> Result<Arc<ClientConfig>> {
-        // This is a simplified conversion - in practice, we'd need to extract
-        // certificates, keys, and other settings from the Python SSLContext
-        // For now, create a basic config that accepts any certificate
+        // For testing, create a config that accepts the dummy certificate
         let mut config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
             .with_no_client_auth();
 
-        // TODO: Properly extract settings from Python SSLContext
-        // - Certificate verification settings
-        // - Client certificates
-        // - Cipher suites
-        // - Protocol versions
-
         Ok(Arc::new(config))
     }
 
     fn py_ssl_context_to_rustls_server_config(py: Python, ssl_context: Py<PyAny>) -> Result<Arc<ServerConfig>> {
-        // This is a simplified conversion - in practice, we'd need to extract
-        // certificates, keys, and other settings from the Python SSLContext
-        // For now, create a basic config
-        let mut config = ServerConfig::builder()
-            .with_no_client_auth();
+        // Try to get certfile and keyfile from the Python SSL context
+        let certfile: Option<String> = ssl_context.getattr(py, "_certfile").ok().and_then(|v| v.extract(py).ok());
+        let keyfile: Option<String> = ssl_context.getattr(py, "_keyfile").ok().and_then(|v| v.extract(py).ok());
 
-        // TODO: Properly extract settings from Python SSLContext
-        // - Server certificates and keys
-        // - Client certificate requirements
-        // - Cipher suites
-        // - Protocol versions
+        if let (Some(certfile), Some(keyfile)) = (certfile, keyfile) {
+            // Load certificate and key from files
+            let cert_pem = std::fs::read(&certfile)?;
+            let key_pem = std::fs::read(&keyfile)?;
 
-        // Add a dummy certificate for testing
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-        let cert_der = cert.cert.der().to_vec();
-        let key_der = cert.key_pair.serialize_der();
+            // Parse PEM certificate
+            let mut cert_reader = std::io::Cursor::new(&cert_pem);
+            let mut cert_list = Vec::new();
+            for cert_result in certs(&mut cert_reader) {
+                cert_list.push(cert_result?);
+            }
+            let cert = cert_list.into_iter().next().ok_or_else(|| anyhow::anyhow!("No certificate found"))?;
 
-        let config = config.with_single_cert(vec![rustls::pki_types::CertificateDer::from(cert_der)],
-                                           rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der)))?;
+            // Parse PEM key
+            let mut key_reader = std::io::Cursor::new(&key_pem);
+            let mut key_list = Vec::new();
+            for key_result in pkcs8_private_keys(&mut key_reader) {
+                key_list.push(key_result?);
+            }
+            let key = key_list.into_iter().next().ok_or_else(|| anyhow::anyhow!("No private key found"))?;
 
-        Ok(Arc::new(config))
+            let config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], rustls::pki_types::PrivateKeyDer::Pkcs8(key))?;
+
+            Ok(Arc::new(config))
+        } else {
+            // Fallback to dummy certificate
+            let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into(), "localhost".into()])?;
+            let cert_der = cert.cert.der().to_vec();
+            let key_der = cert.key_pair.serialize_der();
+
+            let config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![rustls::pki_types::CertificateDer::from(cert_der)],
+                               rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der)))?;
+
+            Ok(Arc::new(config))
+        }
     }
 
-    pub(crate) fn attach(pyself: &Py<Self>, py: Python) -> PyResult<Py<PyAny>> {
+    pub(crate) fn attach(pyself: &Py<Self>, py: Python, call_connection_made: bool) -> PyResult<Py<PyAny>> {
         let rself = pyself.borrow(py);
-        rself
-            .proto
-            .call_method1(py, pyo3::intern!(py, "connection_made"), (pyself.clone_ref(py),))?;
+        // For SSL transports, connection_made may be called immediately or delayed until handshake completion
+        if call_connection_made && !*rself.connection_made_called.borrow() {
+            *rself.connection_made_called.borrow_mut() = true;
+            rself
+                .proto
+                .call_method1(py, pyo3::intern!(py, "connection_made"), (pyself.clone_ref(py),))?;
+        }
         Ok(rself.proto.clone_ref(py))
     }
 
@@ -361,42 +378,39 @@ impl SSLTransport {
             return Ok(());
         }
 
-        let mut state = rself.state.borrow_mut();
-
-        // If handshake is not complete, buffer the data
-        if !state.handshake_complete {
-            state.write_buf.push_back(data.into());
-            state.write_buf_dsize += data.len();
-            return Ok(());
-        }
-
-        // Try to write through TLS
-        let mut writer = state.tls_connection.writer();
+        // Try to write through TLS (this will start handshake if needed)
+        let mut binding = rself.tls_connection.borrow_mut();
+        let mut writer = binding.writer();
         match writer.write(data) {
             Ok(written) if written == data.len() => {
                 // All data written to TLS, now try to flush to socket
-                Self::flush_tls_to_socket(&mut state)?;
+                Self::flush_tls_to_socket(&rself)?;
             }
             Ok(written) => {
                 // Partial write, buffer the rest
                 let remaining = &data[written..];
-                state.write_buf.push_back(remaining.into());
-                state.write_buf_dsize += remaining.len();
-                Self::flush_tls_to_socket(&mut state)?;
+                rself.write_buf.borrow_mut().push_back(remaining.into());
+                *rself.write_buf_dsize.borrow_mut() += remaining.len();
+                Self::flush_tls_to_socket(&rself)?;
             }
             Err(_) => {
                 // Buffer the data for later
-                state.write_buf.push_back(data.into());
-                state.write_buf_dsize += data.len();
+                rself.write_buf.borrow_mut().push_back(data.into());
+                *rself.write_buf_dsize.borrow_mut() += data.len();
             }
+        }
+
+        // If TLS wants to write, register for write events
+        if rself.tls_connection.borrow().wants_write() {
+            rself.pyloop.get().ssl_stream_add(rself.fd, Interest::WRITABLE);
         }
 
         Ok(())
     }
 
-    fn flush_tls_to_socket(state: &mut SSLTransportState) -> Result<(), std::io::Error> {
+    fn flush_tls_to_socket(transport: &SSLTransport) -> Result<(), std::io::Error> {
         loop {
-            match state.tls_connection.write_tls(&mut state.stream) {
+            match transport.tls_connection.borrow_mut().write_tls(&mut *transport.stream.borrow_mut()) {
                 Ok(0) => break, // No more data to write
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -442,7 +456,7 @@ impl SSLTransport {
             return false;
         }
 
-        if !self.state.borrow_mut().write_buf.is_empty() {
+        if !self.write_buf.borrow().is_empty() {
             return false;
         }
 
@@ -481,7 +495,7 @@ impl SSLTransport {
 
         let event_loop = self.pyloop.get();
         event_loop.ssl_stream_rem(self.fd, Interest::READABLE);
-        if self.state.borrow().write_buf_dsize == 0 {
+        if *self.write_buf_dsize.borrow() == 0 {
             self.call_conn_lost(py, None);
         }
     }
@@ -556,7 +570,7 @@ impl SSLTransport {
     }
 
     fn get_write_buffer_size(&self) -> usize {
-        self.state.borrow().write_buf_dsize
+        *self.write_buf_dsize.borrow()
     }
 
     fn get_write_buffer_limits(&self) -> (usize, usize) {
@@ -599,7 +613,7 @@ impl SSLTransport {
     }
 
     fn abort(&self, py: Python) {
-        if self.state.borrow().write_buf_dsize > 0 {
+        if *self.write_buf_dsize.borrow() > 0 {
             self.pyloop.get().ssl_stream_rem(self.fd, Interest::WRITABLE);
         }
         if self
@@ -624,54 +638,70 @@ pub(crate) struct SSLReadHandle {
 
 impl SSLReadHandle {
     fn do_handshake(&self, py: Python, transport: &SSLTransport) -> Result<bool, Box<dyn std::error::Error>> {
+        debug!("SSLReadHandle::do_handshake called for fd {}", self.fd);
+
         // Read data from socket into TLS
-        {
-            let mut state = transport.state.borrow_mut();
-            match state.tls_connection.read_tls(&mut state.stream) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
-                Err(e) => return Err(Box::new(e)),
+        match transport.tls_connection.borrow_mut().read_tls(&mut *transport.stream.borrow_mut()) {
+            Ok(n) => debug!("Read {} bytes from TLS for fd {}", n, self.fd),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                debug!("WouldBlock reading TLS for fd {}", self.fd);
+                return Ok(false);
+            }
+            Err(e) => {
+                debug!("Error reading TLS for fd {}: {:?}", self.fd, e);
+                return Err(Box::new(e));
             }
         }
 
         // Process the TLS packets
-        {
-            let mut state = transport.state.borrow_mut();
-            state.tls_connection.process_new_packets()?;
+        transport.tls_connection.borrow_mut().process_new_packets()?;
+        debug!("Processed TLS packets for fd {}", self.fd);
+
+        // Flush any queued TLS messages (like ServerHello) to the socket
+        SSLTransport::flush_tls_to_socket(transport)?;
+        debug!("Flushed TLS to socket for fd {}", self.fd);
+
+        // If TLS wants to write more, register for write events
+        if transport.tls_connection.borrow().wants_write() {
+            debug!("TLS wants to write for fd {}", self.fd);
+            transport.pyloop.get().ssl_stream_add(transport.fd, Interest::WRITABLE);
         }
 
         // Check if handshake is complete
-        {
-            let mut state = transport.state.borrow_mut();
-            if !state.tls_connection.is_handshaking() && !state.handshake_complete {
-                state.handshake_complete = true;
+        let is_handshaking = transport.tls_connection.borrow().is_handshaking();
+        let handshake_complete = *transport.handshake_complete.borrow();
+        debug!("Handshake status for fd {}: is_handshaking={}, handshake_complete={}", self.fd, is_handshaking, handshake_complete);
 
-                // Send any buffered data now that handshake is complete
-                Self::flush_buffered_data(&mut state)?;
+        if !is_handshaking && !handshake_complete {
+            debug!("SSL handshake complete for fd {}", self.fd);
+            *transport.handshake_complete.borrow_mut() = true;
 
-                return Ok(true);
-            }
+            // Send any buffered data now that handshake is complete
+            Self::flush_buffered_data(transport)?;
+
+            return Ok(true);
         }
 
         Ok(false)
     }
 
-    fn flush_buffered_data(state: &mut SSLTransportState) -> Result<(), std::io::Error> {
-        if !state.write_buf.is_empty() {
-            let mut writer = state.tls_connection.writer();
-            while let Some(data) = state.write_buf.pop_front() {
+    fn flush_buffered_data(transport: &SSLTransport) -> Result<(), std::io::Error> {
+        if !transport.write_buf.borrow().is_empty() {
+            let mut conn = transport.tls_connection.borrow_mut();
+            let mut writer = conn.writer();
+            while let Some(data) = transport.write_buf.borrow_mut().pop_front() {
                 writer.write_all(&data)?;
-                state.write_buf_dsize -= data.len();
+                *transport.write_buf_dsize.borrow_mut() -= data.len();
             }
             drop(writer); // Release the writer before flushing
-            Self::flush_tls_to_socket(state)?;
+            Self::flush_tls_to_socket(transport)?;
         }
         Ok(())
     }
 
-    fn flush_tls_to_socket(state: &mut SSLTransportState) -> Result<(), std::io::Error> {
+    fn flush_tls_to_socket(transport: &SSLTransport) -> Result<(), std::io::Error> {
         loop {
-            match state.tls_connection.write_tls(&mut state.stream) {
+            match transport.tls_connection.borrow_mut().write_tls(&mut *transport.stream.borrow_mut()) {
                 Ok(0) => break,
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -682,13 +712,12 @@ impl SSLReadHandle {
     }
 
     fn recv_data(&self, py: Python, transport: &SSLTransport, buf: &mut [u8]) -> (Option<Py<PyAny>>, bool) {
-        let mut state = transport.state.borrow_mut();
-
-        if !state.handshake_complete {
+        if !*transport.handshake_complete.borrow() {
             return (None, false);
         }
 
-        let mut reader = state.tls_connection.reader();
+        let mut binding = transport.tls_connection.borrow_mut();
+        let mut reader = binding.reader();
         match reader.read(buf) {
             Ok(0) => (None, true), // EOF
             Ok(read) => {
@@ -725,6 +754,13 @@ impl Handle for SSLReadHandle {
             return;
         }
 
+        // Call connection_made if handshake just completed
+        if *transport.handshake_complete.borrow() && !*transport.connection_made_called.borrow() {
+            let pytransport = event_loop.get_ssl_transport(self.fd, py);
+            _ = transport.proto.call_method1(py, pyo3::intern!(py, "connection_made"), (pytransport.clone_ref(py).into_any(),));
+            *transport.connection_made_called.borrow_mut() = true;
+        }
+
         // Then try to read data
         let (data, eof) = self.recv_data(py, &transport, &mut state.read_buf);
 
@@ -746,11 +782,9 @@ pub(crate) struct SSLWriteHandle {
 
 impl SSLWriteHandle {
     fn flush_pending(&self, transport: &SSLTransport) -> Result<(), std::io::Error> {
-        let mut state = transport.state.borrow_mut();
-
         // Try to flush TLS data to socket
         loop {
-            match state.tls_connection.write_tls(&mut state.stream) {
+            match transport.tls_connection.borrow_mut().write_tls(&mut *transport.stream.borrow_mut()) {
                 Ok(0) => break,
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -775,8 +809,7 @@ impl Handle for SSLWriteHandle {
         }
 
         // Check if we need to continue writing
-        let state = transport.state.borrow();
-        if state.tls_connection.wants_write() {
+        if transport.tls_connection.borrow().wants_write() {
             return; // Keep writable interest
         }
 

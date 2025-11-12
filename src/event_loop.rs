@@ -247,6 +247,9 @@ impl EventLoop {
                     let ssl_transport = bound.downcast::<SSLTransport>().unwrap().clone().unbind();
                     self.ssl_transports.pin().insert(fd, ssl_transport);
                     io_handles.insert(Token(fd), IOHandle::SSLStream(Interest::READABLE));
+                    // Register with mio poll
+                    self.ssl_stream_add(fd, Interest::READABLE);
+                    debug!("Server SSL transport registered for fd {}", fd);
                 } else {
                     let bound = pytransport.bind(py);
                     let tcp_transport = bound.downcast::<TCPTransport>().unwrap().clone().unbind();
@@ -275,6 +278,7 @@ impl EventLoop {
     #[inline]
     fn handle_io_ssls(&self, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
         let fd = event.token().0;
+        debug!("handle_io_ssls: fd={}, readable={}, writable={}", fd, event.is_readable(), event.is_writable());
         if event.is_readable() {
             handles_ready.push_back(Box::new(SSLReadHandle { fd }));
         } else if event.is_writable() {
@@ -520,6 +524,7 @@ impl EventLoop {
 
     #[inline]
     pub(crate) fn ssl_stream_add(&self, fd: usize, interest: Interest) {
+        debug!("ssl_stream_add: registering fd {} for interest {:?}", fd, interest);
         let token = Token(fd);
         self.handles_io.pin().update_or_insert_with(
             token,
@@ -1300,6 +1305,23 @@ impl EventLoop {
         Py::new(py, server)
     }
 
+    fn _ssl_server(
+        pyself: Py<Self>,
+        py: Python,
+        socks: Py<PyAny>,
+        rsocks: Vec<(i32, i32)>,
+        protocol_factory: Py<PyAny>,
+        ssl_context: Py<PyAny>,
+        backlog: i32,
+    ) -> PyResult<Py<Server>> {
+        let mut servers = Vec::new();
+        for (fd, family) in rsocks {
+            servers.push(TCPServer::from_fd_ssl(fd, family, backlog, protocol_factory.clone_ref(py), ssl_context.clone_ref(py)));
+        }
+        let server = Server::tcp(pyself.clone_ref(py), socks, servers);
+        Py::new(py, server)
+    }
+
     fn _tcp_stream_bound(&self, fd: usize) -> bool {
         self.tcp_transports.pin().contains_key(&fd)
     }
@@ -1316,7 +1338,7 @@ impl EventLoop {
         let transport = SSLTransport::from_py_client(py, &pyself, sock, protocol_factory, server_hostname, ssl_context)?;
         let fd = transport.fd;
         let pytransport = Py::new(py, transport)?;
-        let proto = SSLTransport::attach(&pytransport, py)?;
+        let proto = SSLTransport::attach(&pytransport, py, true)?;
         rself.ssl_transports.pin().insert(fd, pytransport.clone_ref(py));
         rself.ssl_stream_add(fd, Interest::READABLE);
         Ok((pytransport, proto))
@@ -1333,7 +1355,7 @@ impl EventLoop {
         let transport = SSLTransport::from_py_server(py, &pyself, sock, protocol_factory, ssl_context)?;
         let fd = transport.fd;
         let pytransport = Py::new(py, transport)?;
-        let proto = SSLTransport::attach(&pytransport, py)?;
+        let proto = SSLTransport::attach(&pytransport, py, false)?;
         rself.ssl_transports.pin().insert(fd, pytransport.clone_ref(py));
         rself.ssl_stream_add(fd, Interest::READABLE);
         Ok((pytransport, proto))
