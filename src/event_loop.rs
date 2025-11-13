@@ -151,6 +151,7 @@ impl EventLoop {
             let io_handles = self.handles_io.pin();
             for event in &state.events {
                 // NOTE: cancellation is not necessary as we have custom futures
+                debug!("[SSL] Processing event for token {}: readable={} writable={}", event.token().0, event.is_readable(), event.is_writable());
                 if let Some(io_handle) = io_handles.get(&event.token()) {
                     match io_handle {
                         IOHandle::Py(handle) => self.handle_io_py(py, event, handle, &mut cb_handles),
@@ -160,6 +161,8 @@ impl EventLoop {
                         IOHandle::UDPSocket(_) => self.handle_io_udp(event, &mut cb_handles),
                         IOHandle::Signals => self.handle_io_signals(py, &mut state.buf, &mut cb_handles),
                     }
+                } else {
+                    debug!("[SSL] No handle found for token {}", event.token().0);
                 }
             }
         }
@@ -241,14 +244,14 @@ impl EventLoop {
                 #[allow(clippy::cast_possible_wrap)]
                 let mut source = Source::FD(fd as i32);
                 if handle.server.ssl_context.is_some() {
-                    debug!("Server accepted connection, creating SSL transport for fd {}", fd);
+                    debug!("[SSL] Server accepted connection, creating SSL transport for fd {}", fd);
                     let (pytransport, stream_handle) = handle.server.new_stream(py, stream);
                     let bound = pytransport.bind(py);
                     let ssl_transport = bound.downcast::<SSLTransport>().unwrap().clone().unbind();
                     self.ssl_transports.pin().insert(fd, ssl_transport);
                     io_handles.insert(Token(fd), IOHandle::SSLStream(Interest::READABLE | Interest::WRITABLE));
                     handles.push_back(stream_handle);
-                    debug!("Server SSL transport registered for fd {}", fd);
+                    debug!("[SSL] Server SSL transport registered for fd {}", fd);
                 } else {
                     let (pytransport, stream_handle) = handle.server.new_stream(py, stream);
                     let bound = pytransport.bind(py);
@@ -519,6 +522,7 @@ impl EventLoop {
     #[inline]
     pub(crate) fn ssl_stream_add(&self, fd: usize, interest: Interest) {
         let token = Token(fd);
+        debug!("[SSL] ssl_stream_add fd {} interest {:?}", fd, interest);
         self.handles_io.pin().update_or_insert_with(
             token,
             |io_handle| {
@@ -600,6 +604,7 @@ impl EventLoop {
     #[inline]
     fn handle_io_ssls(&self, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
         let fd = event.token().0;
+        debug!("[SSL] handle_io_ssls fd {} readable={} writable={}", fd, event.is_readable(), event.is_writable());
         if event.is_readable() {
             handles_ready.push_back(Box::new(SSLReadHandle { fd }));
         } else if event.is_writable() {

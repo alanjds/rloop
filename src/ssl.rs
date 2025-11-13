@@ -10,7 +10,7 @@ use std::{
 use anyhow::Result;
 use log::{info, debug};
 use mio::Interest;
-use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream};
+use openssl::ssl::{ShutdownResult, Ssl, SslContext, SslMethod, SslStream, ShutdownResult::*};
 use pyo3::{buffer::PyBuffer, prelude::*, types::PyBytes, IntoPyObjectExt, PyResult};
 use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -26,11 +26,18 @@ use crate::{
     utils::syscall,
 };
 
+#[derive(Debug)]
+enum ShutdownState {
+    SendCloseNotify,
+    ReceiveCloseNotify,
+}
+
 pub(crate) struct SSLTransportState {
     ssl_stream: SslStream<std::net::TcpStream>,
     write_buf: VecDeque<Box<[u8]>>,
     write_buf_dsize: usize,
     handshake_complete: bool,
+    shutdown_state: Option<ShutdownState>,
 }
 
 #[pyclass(frozen, unsendable, module = "rloop._rloop")]
@@ -45,6 +52,7 @@ pub(crate) struct SSLTransport {
     water_hi: atomic::AtomicUsize,
     water_lo: atomic::AtomicUsize,
     weof: atomic::AtomicBool,
+    shutdown_pending: atomic::AtomicBool,
     // py protocol fields
     pub proto: Py<PyAny>,
     proto_buffered: bool,
@@ -71,7 +79,7 @@ impl SSLTransport {
         let fd = sock.0 as usize;
 
         // Create SSL context from Python SSL context
-        let ssl_ctx = Self::create_ssl_context(py, &ssl_context)?;
+        let ssl_ctx = Self::create_ssl_context(py, &ssl_context, server)?;
         let mut ssl = Ssl::new(&ssl_ctx)?;
 
         // Set SSL mode based on server parameter
@@ -88,14 +96,22 @@ impl SSLTransport {
         // Set non-blocking mode
         ssl_stream.get_mut().set_nonblocking(true)?;
 
-        // For non-blocking SSL, try to initiate handshake
-        // This will often fail with WANT_READ/WANT_WRITE, which is expected
+        // For clients, initiate handshake immediately
+        // For servers, wait for client data
+        if !server {
+            // For non-blocking SSL, try to initiate handshake
+            // This will often fail with WANT_READ/WANT_WRITE, which is expected
+            let _ = ssl_stream.do_handshake();
+        }
+
+        println!("[SSL] Created SSL transport for fd {} (server={})", fd, server);
 
         let state = SSLTransportState {
             ssl_stream,
             write_buf: VecDeque::new(),
             write_buf_dsize: 0,
             handshake_complete: false,
+            shutdown_state: None,
         };
 
         let wh = 1024 * 64;
@@ -125,6 +141,7 @@ impl SSLTransport {
             water_hi: wh.into(),
             water_lo: wl.into(),
             weof: false.into(),
+            shutdown_pending: false.into(),
             proto,
             proto_buffered,
             proto_paused: false.into(),
@@ -136,7 +153,7 @@ impl SSLTransport {
         })
     }
 
-    fn create_ssl_context(py: Python, ssl_context: &Py<PyAny>) -> Result<SslContext> {
+    fn create_ssl_context(py: Python, ssl_context: &Py<PyAny>, server: bool) -> Result<SslContext> {
         let mut ctx = SslContext::builder(SslMethod::tls())?;
 
         // Import ssl module to get constants
@@ -246,6 +263,50 @@ impl SSLTransport {
     fn call_conn_lost(&self, py: Python, err: Option<PyErr>) {
         _ = self.protom_conn_lost.call1(py, (err,));
         self.pyloop.get().ssl_stream_close(py, self.fd);
+    }
+
+    fn try_shutdown(&self, py: Python) -> Result<bool> {
+        let mut state = self.state.borrow_mut();
+        match state.ssl_stream.shutdown() {
+            Ok(shutdown_result) => {
+                debug!("[SSL] Shutdown completed for fd {}: {:?}", self.fd, shutdown_result);
+                Ok(true)
+            }
+            Err(err) => {
+                if let Some(ssl_err) = err.source()
+                    .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
+                {
+                    match ssl_err.code() {
+                        openssl::ssl::ErrorCode::WANT_READ => {
+                            // Need to read peer's close_notify, but peer may have closed
+                            // For now, assume shutdown is complete if peer closed
+                            debug!("[SSL] Shutdown WANT_READ for fd {}, assuming complete", self.fd);
+                            Ok(true)
+                        }
+                        openssl::ssl::ErrorCode::WANT_WRITE => {
+                            // Need to write our close_notify
+                            debug!("[SSL] Shutdown WANT_WRITE for fd {}", self.fd);
+                            state.shutdown_state = Some(ShutdownState::SendCloseNotify);
+                            Ok(false)
+                        }
+                        _ => {
+                            // Other SSL error, consider shutdown complete
+                            debug!("[SSL] Shutdown SSL error for fd {}: {:?}", self.fd, ssl_err.code());
+                            Ok(true)
+                        }
+                    }
+                } else {
+                    // Non-SSL error, consider shutdown complete
+                    debug!("[SSL] Shutdown non-SSL error for fd {}: {:?}", self.fd, err);
+                    Ok(true)
+                }
+            }
+        }
+    }
+
+    fn complete_shutdown(&self, py: Python) {
+        debug!("[SSL] Completing shutdown for fd {}", self.fd);
+        self.call_conn_lost(py, None);
     }
 
     fn try_write(pyself: &Py<Self>, py: Python, data: &[u8]) -> PyResult<()> {
@@ -480,14 +541,28 @@ impl SSLTransport {
                 .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
                 .is_ok()
             {
-                // Try to shutdown SSL connection
-                let shutdown_result = self.state.borrow_mut().ssl_stream.shutdown();
-                if let Err(err) = shutdown_result {
-                    println!("[SSL] Shutdown failed for fd {}: {:?}", self.fd, err);
+                // Try to shutdown SSL connection asynchronously
+                match self.try_shutdown(py) {
+                    Ok(true) => {
+                        // Shutdown completed
+                        event_loop.ssl_stream_rem(self.fd, Interest::WRITABLE);
+                        self.call_conn_lost(py, None);
+                    }
+                    Ok(false) => {
+                        // Shutdown in progress, set pending and wait for events
+                        self.shutdown_pending.store(true, atomic::Ordering::Relaxed);
+                        // Keep writable interest to complete shutdown
+                    }
+                    Err(err) => {
+                        debug!("[SSL] Shutdown error for fd {}: {:?}", self.fd, err);
+                        event_loop.ssl_stream_rem(self.fd, Interest::WRITABLE);
+                        self.call_conn_lost(py, None);
+                    }
                 }
+            } else {
+                event_loop.ssl_stream_rem(self.fd, Interest::WRITABLE);
+                self.call_conn_lost(py, None);
             }
-            event_loop.ssl_stream_rem(self.fd, Interest::WRITABLE);
-            self.call_conn_lost(py, None);
         }
     }
 
@@ -742,13 +817,36 @@ impl SSLReadHandle {
 
 impl crate::handles::Handle for SSLReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut crate::event_loop::EventLoopRunState) {
+        debug!("[SSL] SSLReadHandle::run called for fd {}", self.fd);
         if let Some(pytransport) = event_loop.get_ssl_transport(self.fd, py) {
             let transport = pytransport.borrow(py);
+            debug!("[SSL] SSLReadHandle::run found transport for fd {}", self.fd);
+
+            // Check if shutdown is pending
+            if transport.shutdown_pending.load(atomic::Ordering::Relaxed) {
+                match transport.try_shutdown(py) {
+                    Ok(true) => {
+                        // Shutdown completed
+                        transport.complete_shutdown(py);
+                        return;
+                    }
+                    Ok(false) => {
+                        // Still waiting for shutdown
+                        return;
+                    }
+                    Err(err) => {
+                        debug!("[SSL] Shutdown error in read handle for fd {}: {:?}", self.fd, err);
+                        transport.complete_shutdown(py);
+                        return;
+                    }
+                }
+            }
 
             // Check if handshake is complete and notify protocol if needed
             let mut state_mut = transport.state.borrow_mut();
             if !state_mut.handshake_complete {
                 // Try to complete handshake
+                debug!("[SSL] Attempting handshake for fd {}", self.fd);
                 match state_mut.ssl_stream.do_handshake() {
                     Ok(_) => {
                         println!("[SSL] Handshake completed for fd {}", self.fd);
@@ -874,6 +972,27 @@ impl crate::handles::Handle for SSLWriteHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut crate::event_loop::EventLoopRunState) {
         if let Some(pytransport) = event_loop.get_ssl_transport(self.fd, py) {
             let transport = pytransport.borrow(py);
+
+            // Check if shutdown is pending
+            if transport.shutdown_pending.load(atomic::Ordering::Relaxed) {
+                match transport.try_shutdown(py) {
+                    Ok(true) => {
+                        // Shutdown completed
+                        transport.complete_shutdown(py);
+                        return;
+                    }
+                    Ok(false) => {
+                        // Still waiting for shutdown
+                        return;
+                    }
+                    Err(err) => {
+                        debug!("[SSL] Shutdown error in write handle for fd {}: {:?}", self.fd, err);
+                        transport.complete_shutdown(py);
+                        return;
+                    }
+                }
+            }
+
             let stream_close;
 
             if let Some(written) = self.write(&transport) {
