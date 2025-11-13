@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
+use log::{info, debug};
 use mio::Interest;
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream};
 use pyo3::{buffer::PyBuffer, prelude::*, types::PyBytes, IntoPyObjectExt, PyResult};
