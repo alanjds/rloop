@@ -151,18 +151,15 @@ impl TCPServerRef {
                 }
             };
 
-            let conn_made = transport
-                .proto
-                .getattr(py, pyo3::intern!(py, "connection_made"))
-                .unwrap();
-            let pytransport = Py::new(py, transport).unwrap();
-            let conn_handle = Py::new(
-                py,
-                CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
-            )
-            .unwrap();
+            let fd = transport.fd;
 
-            (pytransport.into_any(), Box::new(conn_handle))
+            // For SSL transports, we need to trigger the read handle immediately
+            // to attempt the handshake
+            let pytransport = Py::new(py, transport).unwrap();
+
+            // Create a handle that calls the SSL read handle
+            let ssl_read_handle = crate::ssl::SSLReadHandle { fd };
+            (pytransport.into_any(), Box::new(ssl_read_handle))
         } else {
             let proto = self.proto_factory.bind(py).call0().unwrap();
 

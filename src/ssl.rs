@@ -96,14 +96,6 @@ impl SSLTransport {
         // Set non-blocking mode
         ssl_stream.get_mut().set_nonblocking(true)?;
 
-        // For clients, initiate handshake immediately
-        // For servers, wait for client data
-        if !server {
-            // For non-blocking SSL, try to initiate handshake
-            // This will often fail with WANT_READ/WANT_WRITE, which is expected
-            let _ = ssl_stream.do_handshake();
-        }
-
         println!("[SSL] Created SSL transport for fd {} (server={})", fd, server);
 
         let state = SSLTransportState {
@@ -163,32 +155,8 @@ impl SSLTransport {
         info!("[SSL] Disabling certificate verification for testing");
         ctx.set_verify(openssl::ssl::SslVerifyMode::NONE);
 
-        // Try to load certificates if available (only for servers)
-        if let Ok(certfile) = ssl_context.getattr(py, "_certfile") {
-            if let Ok(keyfile) = ssl_context.getattr(py, "_keyfile") {
-                let certfile_str: String = certfile.extract(py)?;
-                let keyfile_str: String = keyfile.extract(py)?;
-                println!("[SSL] Loading certificates: cert={}, key={}", certfile_str, keyfile_str);
-                ctx.set_private_key_file(&keyfile_str, openssl::ssl::SslFiletype::PEM)?;
-                ctx.set_certificate_chain_file(&certfile_str)?;
-            }
-        } else {
-            println!("[SSL] No certificates loaded - this is normal for clients");
-        }
-
-        // Load CA certificates for verification
-        // For clients, load the server's certificate as a trusted CA
-        if let Ok(certfile) = ssl_context.getattr(py, "_certfile") {
-            if let Ok(certfile_str) = certfile.extract::<String>(py) {
-                println!("[SSL] Loading CA certificate from file: {}", certfile_str);
-                if let Ok(pem) = std::fs::read_to_string(&certfile_str) {
-                    if let Ok(x509_cert) = openssl::x509::X509::from_pem(pem.as_bytes()) {
-                        ctx.cert_store_mut().add_cert(x509_cert)?;
-                        println!("[SSL] Added CA certificate to trust store");
-                    }
-                }
-            }
-        }
+        // For testing, don't load certificates - see if basic handshake works
+        debug!("[SSL] Not loading certificates for testing");
 
         Ok(ctx.build())
     }
@@ -866,6 +834,7 @@ impl crate::handles::Handle for SSLReadHandle {
                                 || ssl_err.code() == openssl::ssl::ErrorCode::WANT_WRITE
                             {
                                 // Still in progress, wait for more events
+                                debug!("[SSL] Handshake still in progress for fd {}: {:?}", self.fd, ssl_err.code());
                                 return;
                             } else {
                                 // Real SSL error
@@ -989,6 +958,47 @@ impl crate::handles::Handle for SSLWriteHandle {
                         debug!("[SSL] Shutdown error in write handle for fd {}: {:?}", self.fd, err);
                         transport.complete_shutdown(py);
                         return;
+                    }
+                }
+            }
+
+            // Check if handshake is complete and notify protocol if needed
+            let mut state_mut = transport.state.borrow_mut();
+            if !state_mut.handshake_complete {
+                // Try to complete handshake
+                debug!("[SSL] Attempting handshake in write handle for fd {}", self.fd);
+                match state_mut.ssl_stream.do_handshake() {
+                    Ok(_) => {
+                        debug!("[SSL] Handshake completed in write handle for fd {}", self.fd);
+                        state_mut.handshake_complete = true;
+                        drop(state_mut); // Release borrow before calling notify
+                        // Notify protocol that connection is ready
+                        if let Err(e) = SSLTransport::notify_connection_made(&pytransport, py) {
+                            debug!("[SSL] Failed to notify connection_made: {:?}", e);
+                        }
+                        return; // Don't process writes yet, just notify
+                    }
+                    Err(err) => {
+                        if let Some(ssl_err) = err.source()
+                            .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
+                        {
+                            if ssl_err.code() == openssl::ssl::ErrorCode::WANT_READ
+                                || ssl_err.code() == openssl::ssl::ErrorCode::WANT_WRITE
+                            {
+                                // Still in progress, wait for more events
+                                return;
+                            } else {
+                                // Real SSL error
+                                debug!("[SSL] Handshake failed in write handle for fd {}: {:?}", self.fd, ssl_err.code());
+                                event_loop.ssl_stream_close(py, self.fd);
+                                return;
+                            }
+                        } else {
+                            // Non-SSL error
+                            debug!("[SSL] Non-SSL handshake error in write handle for fd {}: {:?}", self.fd, err);
+                            event_loop.ssl_stream_close(py, self.fd);
+                            return;
+                        }
                     }
                 }
             }
