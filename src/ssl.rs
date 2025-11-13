@@ -474,6 +474,18 @@ impl SSLTransport {
         let event_loop = self.pyloop.get();
         event_loop.ssl_stream_rem(self.fd, Interest::READABLE);
         if self.state.borrow().write_buf_dsize == 0 {
+            // For SSL connections, we need to send close_notify before closing
+            if self
+                .weof
+                .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+                .is_ok()
+            {
+                // Try to shutdown SSL connection
+                let shutdown_result = self.state.borrow_mut().ssl_stream.shutdown();
+                if let Err(err) = shutdown_result {
+                    println!("[SSL] Shutdown failed for fd {}: {:?}", self.fd, err);
+                }
+            }
             event_loop.ssl_stream_rem(self.fd, Interest::WRITABLE);
             self.call_conn_lost(py, None);
         }
