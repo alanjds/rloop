@@ -29,7 +29,6 @@ pub(crate) struct TCPServer {
     sfamily: i32,
     backlog: i32,
     protocol_factory: Py<PyAny>,
-    ssl_context: Option<Py<PyAny>>,
 }
 
 impl TCPServer {
@@ -39,17 +38,6 @@ impl TCPServer {
             sfamily,
             backlog,
             protocol_factory,
-            ssl_context: None,
-        }
-    }
-
-    pub(crate) fn from_fd_ssl(fd: i32, sfamily: i32, backlog: i32, protocol_factory: Py<PyAny>, ssl_context: Py<PyAny>) -> Self {
-        Self {
-            fd,
-            sfamily,
-            backlog,
-            protocol_factory,
-            ssl_context: Some(ssl_context),
         }
     }
 
@@ -64,7 +52,6 @@ impl TCPServer {
             pyloop: pyloop.clone_ref(py),
             sfamily: self.sfamily,
             proto_factory: self.protocol_factory.clone_ref(py),
-            ssl_context: self.ssl_context.as_ref().map(|ctx| ctx.clone_ref(py)),
         };
         pyloop.get().tcp_listener_add(listener, sref);
 
@@ -79,41 +66,25 @@ impl TCPServer {
     }
 
     pub(crate) fn streams_close(&self, py: Python, event_loop: &EventLoop) {
-        let mut tcp_transports = Vec::new();
-        let mut ssl_transports = Vec::new();
+        let mut transports = Vec::new();
         event_loop.with_tcp_listener_streams(self.fd as usize, |streams| {
             for stream_fd in &streams.pin() {
-                if let Some(transport) = event_loop.get_tcp_transport(*stream_fd, py) {
-                    tcp_transports.push(transport);
-                } else if let Some(transport) = event_loop.get_ssl_transport(*stream_fd, py) {
-                    ssl_transports.push(transport);
-                }
+                transports.push(event_loop.get_tcp_transport(*stream_fd, py));
             }
         });
-        for transport in tcp_transports {
-            transport.borrow(py).close(py);
-        }
-        for transport in ssl_transports {
+        for transport in transports {
             transport.borrow(py).close(py);
         }
     }
 
     pub(crate) fn streams_abort(&self, py: Python, event_loop: &EventLoop) {
-        let mut tcp_transports = Vec::new();
-        let mut ssl_transports = Vec::new();
+        let mut transports = Vec::new();
         event_loop.with_tcp_listener_streams(self.fd as usize, |streams| {
             for stream_fd in &streams.pin() {
-                if let Some(transport) = event_loop.get_tcp_transport(*stream_fd, py) {
-                    tcp_transports.push(transport);
-                } else if let Some(transport) = event_loop.get_ssl_transport(*stream_fd, py) {
-                    ssl_transports.push(transport);
-                }
+                transports.push(event_loop.get_tcp_transport(*stream_fd, py));
             }
         });
-        for transport in tcp_transports {
-            transport.borrow(py).abort(py);
-        }
-        for transport in ssl_transports {
+        for transport in transports {
             transport.borrow(py).abort(py);
         }
     }
@@ -124,66 +95,33 @@ pub(crate) struct TCPServerRef {
     pyloop: Py<EventLoop>,
     sfamily: i32,
     proto_factory: Py<PyAny>,
-    pub ssl_context: Option<Py<PyAny>>,
 }
 
 impl TCPServerRef {
     #[inline]
-    pub(crate) fn new_stream(&self, py: Python, stream: TcpStream) -> (Py<PyAny>, BoxedHandle) {
-        if let Some(ssl_context) = &self.ssl_context {
-            // Create SSL transport
-            let fd = stream.as_raw_fd();
-            let socket_family = self.sfamily;
-            let sock = (fd, socket_family);
+    pub(crate) fn new_stream(&self, py: Python, stream: TcpStream) -> (Py<TCPTransport>, BoxedHandle) {
+        let proto = self.proto_factory.bind(py).call0().unwrap();
 
-            let transport = match crate::ssl::SSLTransport::new(
-                py,
-                self.pyloop.clone_ref(py),
-                sock,
-                ssl_context.clone_ref(py),
-                self.proto_factory.clone_ref(py),
-                true, // server connection
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("SSL transport creation failed: {:?}", e);
-                    panic!("SSL transport creation failed");
-                }
-            };
-
-            let fd = transport.fd;
-
-            // For SSL transports, we need to trigger the read handle immediately
-            // to attempt the handshake
-            let pytransport = Py::new(py, transport).unwrap();
-
-            // Create a handle that calls the SSL read handle
-            let ssl_read_handle = crate::ssl::SSLReadHandle { fd };
-            (pytransport.into_any(), Box::new(ssl_read_handle))
-        } else {
-            let proto = self.proto_factory.bind(py).call0().unwrap();
-
-            let transport = TCPTransport::new(
-                py,
-                self.pyloop.clone_ref(py),
-                stream,
-                proto,
-                self.sfamily,
-                Some(self.fd),
-            );
-            let conn_made = transport
-                .proto
-                .getattr(py, pyo3::intern!(py, "connection_made"))
-                .unwrap();
-            let pytransport = Py::new(py, transport).unwrap();
-            let conn_handle = Py::new(
-                py,
-                CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
-            )
+        let transport = TCPTransport::new(
+            py,
+            self.pyloop.clone_ref(py),
+            stream,
+            proto,
+            self.sfamily,
+            Some(self.fd),
+        );
+        let conn_made = transport
+            .proto
+            .getattr(py, pyo3::intern!(py, "connection_made"))
             .unwrap();
+        let pytransport = Py::new(py, transport).unwrap();
+        let conn_handle = Py::new(
+            py,
+            CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
+        )
+        .unwrap();
 
-            (pytransport.into_any(), Box::new(conn_handle))
-        }
+        (pytransport, Box::new(conn_handle))
     }
 }
 struct TCPTransportState {
@@ -678,35 +616,34 @@ impl TCPReadHandle {
 
 impl Handle for TCPReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
-        if let Some(pytransport) = event_loop.get_tcp_transport(self.fd, py) {
-            let transport = pytransport.borrow(py);
+        let pytransport = event_loop.get_tcp_transport(self.fd, py);
+        let transport = pytransport.borrow(py);
 
-            // NOTE: we need to consume all the data coming from the socket even when it exceeds the buffer,
-            //       otherwise we won't get another readable event from the poller
-            let mut close = false;
-            loop {
-                let (data, eof) = match transport.proto_buffered {
-                    true => self.recv_buffered(py, &transport),
-                    false => self.recv_direct(py, &transport, &mut state.read_buf),
-                };
+        // NOTE: we need to consume all the data coming from the socket even when it exceeds the buffer,
+        //       otherwise we won't get another readable event from the poller
+        let mut close = false;
+        loop {
+            let (data, eof) = match transport.proto_buffered {
+                true => self.recv_buffered(py, &transport),
+                false => self.recv_direct(py, &transport, &mut state.read_buf),
+            };
 
-                if let Some(data) = data {
-                    _ = transport.protom_recv_data.call1(py, (data,));
-                    if !eof {
-                        continue;
-                    }
+            if let Some(data) = data {
+                _ = transport.protom_recv_data.call1(py, (data,));
+                if !eof {
+                    continue;
                 }
-
-                if eof {
-                    close = self.recv_eof(py, event_loop, &transport);
-                }
-
-                break;
             }
 
-            if close {
-                event_loop.tcp_stream_close(py, self.fd);
+            if eof {
+                close = self.recv_eof(py, event_loop, &transport);
             }
+
+            break;
+        }
+
+        if close {
+            event_loop.tcp_stream_close(py, self.fd);
         }
     }
 }
@@ -752,33 +689,32 @@ impl TCPWriteHandle {
 
 impl Handle for TCPWriteHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        if let Some(pytransport) = event_loop.get_tcp_transport(self.fd, py) {
-            let transport = pytransport.borrow(py);
-            let stream_close;
+        let pytransport = event_loop.get_tcp_transport(self.fd, py);
+        let transport = pytransport.borrow(py);
+        let stream_close;
 
-            if let Some(written) = self.write(&transport) {
-                if written > 0 {
-                    TCPTransport::write_buf_size_decr(&pytransport, py);
-                }
-                stream_close = match transport.state.borrow().write_buf.is_empty() {
-                    true => transport.close_from_write_handle(py, false),
-                    false => None,
-                };
-            } else {
-                stream_close = transport.close_from_write_handle(py, true);
+        if let Some(written) = self.write(&transport) {
+            if written > 0 {
+                TCPTransport::write_buf_size_decr(&pytransport, py);
             }
+            stream_close = match transport.state.borrow().write_buf.is_empty() {
+                true => transport.close_from_write_handle(py, false),
+                false => None,
+            };
+        } else {
+            stream_close = transport.close_from_write_handle(py, true);
+        }
 
-            if transport.state.borrow().write_buf.is_empty() {
-                event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
-            }
+        if transport.state.borrow().write_buf.is_empty() {
+            event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
+        }
 
-            match stream_close {
-                Some(true) => event_loop.tcp_stream_close(py, self.fd),
-                Some(false) => {
-                    _ = transport.state.borrow().stream.shutdown(std::net::Shutdown::Write);
-                }
-                _ => {}
+        match stream_close {
+            Some(true) => event_loop.tcp_stream_close(py, self.fd),
+            Some(false) => {
+                _ = transport.state.borrow().stream.shutdown(std::net::Shutdown::Write);
             }
+            _ => {}
         }
     }
 }
