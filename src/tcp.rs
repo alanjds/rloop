@@ -29,6 +29,7 @@ pub(crate) struct TCPServer {
     sfamily: i32,
     backlog: i32,
     protocol_factory: Py<PyAny>,
+    ssl_config: Option<rustls::ServerConfig>,
 }
 
 impl TCPServer {
@@ -38,6 +39,17 @@ impl TCPServer {
             sfamily,
             backlog,
             protocol_factory,
+            ssl_config: None,
+        }
+    }
+
+    pub(crate) fn from_fd_ssl(fd: i32, sfamily: i32, backlog: i32, protocol_factory: Py<PyAny>, ssl_config: rustls::ServerConfig) -> Self {
+        Self {
+            fd,
+            sfamily,
+            backlog,
+            protocol_factory,
+            ssl_config: Some(ssl_config),
         }
     }
 
@@ -52,6 +64,7 @@ impl TCPServer {
             pyloop: pyloop.clone_ref(py),
             sfamily: self.sfamily,
             proto_factory: self.protocol_factory.clone_ref(py),
+            ssl_config: self.ssl_config.clone(),
         };
         pyloop.get().tcp_listener_add(listener, sref);
 
@@ -95,6 +108,7 @@ pub(crate) struct TCPServerRef {
     pyloop: Py<EventLoop>,
     sfamily: i32,
     proto_factory: Py<PyAny>,
+    ssl_config: Option<rustls::ServerConfig>,
 }
 
 impl TCPServerRef {
@@ -110,6 +124,12 @@ impl TCPServerRef {
             self.sfamily,
             Some(self.fd),
         );
+
+        // Initialize TLS if this is an SSL server
+        if let Some(ref ssl_config) = self.ssl_config {
+            transport.initialize_tls_server(ssl_config.clone());
+        }
+
         let conn_made = transport
             .proto
             .getattr(py, pyo3::intern!(py, "connection_made"))
@@ -123,9 +143,68 @@ impl TCPServerRef {
 
         (pytransport, Box::new(conn_handle))
     }
+
+    #[inline]
+    fn get_ssl_config(&self, py: Python) -> Option<rustls::ServerConfig> {
+        // We need to get the SSL config from the server that created this reference
+        // For now, we'll check if there's an SSL server associated with this listener
+        // This is a simplified approach - in a real implementation we'd store the config in the ref
+        None // TODO: Pass SSL config through the server reference
+    }
 }
+enum TLSConnection {
+    Server(rustls::ServerConnection),
+    Client(rustls::ClientConnection),
+}
+
+impl TLSConnection {
+    fn read_tls(&mut self, rd: &mut std::io::Cursor<&[u8]>) -> Result<usize, std::io::Error> {
+        match self {
+            TLSConnection::Server(conn) => conn.read_tls(rd),
+            TLSConnection::Client(conn) => conn.read_tls(rd),
+        }
+    }
+
+    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
+        match self {
+            TLSConnection::Server(conn) => conn.process_new_packets(),
+            TLSConnection::Client(conn) => conn.process_new_packets(),
+        }
+    }
+
+    fn is_handshaking(&self) -> bool {
+        match self {
+            TLSConnection::Server(conn) => conn.is_handshaking(),
+            TLSConnection::Client(conn) => conn.is_handshaking(),
+        }
+    }
+
+    fn reader(&mut self) -> rustls::Reader {
+        match self {
+            TLSConnection::Server(conn) => conn.reader(),
+            TLSConnection::Client(conn) => conn.reader(),
+        }
+    }
+
+    fn writer(&mut self) -> rustls::Writer {
+        match self {
+            TLSConnection::Server(conn) => conn.writer(),
+            TLSConnection::Client(conn) => conn.writer(),
+        }
+    }
+
+    fn write_tls(&mut self, wr: &mut dyn std::io::Write) -> Result<usize, std::io::Error> {
+        match self {
+            TLSConnection::Server(conn) => conn.write_tls(wr),
+            TLSConnection::Client(conn) => conn.write_tls(wr),
+        }
+    }
+}
+
 struct TCPTransportState {
     stream: TcpStream,
+    tls_conn: Option<TLSConnection>,
+    handshake_complete: bool,
     write_buf: VecDeque<Box<[u8]>>,
     write_buf_dsize: usize,
 }
@@ -166,6 +245,8 @@ impl TCPTransport {
         let fd = stream.as_raw_fd() as usize;
         let state = TCPTransportState {
             stream,
+            tls_conn: None,
+            handshake_complete: false,
             write_buf: VecDeque::new(),
             write_buf_dsize: 0,
         };
@@ -225,6 +306,27 @@ impl TCPTransport {
             .proto
             .call_method1(py, pyo3::intern!(py, "connection_made"), (pyself.clone_ref(py),))?;
         Ok(rself.proto.clone_ref(py))
+    }
+
+    pub(crate) fn initialize_tls_server(&self, ssl_config: rustls::ServerConfig) {
+        let mut state = self.state.borrow_mut();
+        state.tls_conn = Some(TLSConnection::Server(rustls::ServerConnection::new(std::sync::Arc::new(ssl_config)).unwrap()));
+        state.handshake_complete = false;
+    }
+
+    pub(crate) fn initialize_tls_client(&self, ssl_config: rustls::ClientConfig, server_name: String) {
+        let mut state = self.state.borrow_mut();
+        let server_name = rustls::pki_types::ServerName::try_from(server_name).unwrap();
+        let conn = rustls::ClientConnection::new(std::sync::Arc::new(ssl_config), server_name).unwrap();
+        state.tls_conn = Some(TLSConnection::Client(conn));
+        state.handshake_complete = false;
+
+        // Check if the client needs to send initial handshake data
+        if let Some(TLSConnection::Client(ref conn)) = state.tls_conn {
+            if conn.wants_write() {
+                self.pyloop.get().tcp_stream_add(self.fd, Interest::WRITABLE);
+            }
+        }
     }
 
     #[inline]
@@ -555,7 +657,97 @@ pub(crate) struct TCPReadHandle {
 impl TCPReadHandle {
     #[inline]
     fn recv_direct(&self, py: Python, transport: &TCPTransport, buf: &mut [u8]) -> (Option<Py<PyAny>>, bool) {
-        let (read, closed) = self.read_into(&mut transport.state.borrow_mut().stream, buf);
+        // Check if this is a TLS connection first
+        let is_tls = transport.state.borrow().tls_conn.is_some();
+
+        if is_tls {
+            // Handle TLS connections
+            let read = {
+                let mut state = transport.state.borrow_mut();
+                let (read, _) = self.read_into(&mut state.stream, buf);
+                read
+            };
+
+            if read > 0 {
+                // Process TLS data
+                {
+                    let mut state = transport.state.borrow_mut();
+                    let tls_conn = state.tls_conn.as_mut().unwrap();
+
+                    // Feed raw bytes to TLS connection
+                    let mut rd = std::io::Cursor::new(&buf[..read]);
+                    if let Err(_) = tls_conn.read_tls(&mut rd) {
+                        // TLS error - close connection
+                        return (None, true);
+                    }
+
+                    // Process the new packets
+                    if let Err(_) = tls_conn.process_new_packets() {
+                        // TLS error - close connection
+                        return (None, true);
+                    }
+                }
+
+                // Check and update handshake status
+                {
+                    let mut state = transport.state.borrow_mut();
+                    let tls_conn = state.tls_conn.as_ref().unwrap();
+                    if !state.handshake_complete && !tls_conn.is_handshaking() {
+                        state.handshake_complete = true;
+                    }
+                }
+
+                // Check if there is pending TLS data to write (handshake, etc.)
+                {
+                    let state = transport.state.borrow();
+                    if let Some(ref tls_conn) = state.tls_conn {
+                        let wants_write = match tls_conn {
+                            TLSConnection::Server(conn) => conn.wants_write(),
+                            TLSConnection::Client(conn) => conn.wants_write(),
+                        };
+                        if wants_write {
+                            transport.pyloop.get().tcp_stream_add(transport.fd, Interest::WRITABLE);
+                        }
+                    }
+                }
+
+                // Check if handshake is complete and read decrypted data
+                let handshake_complete = transport.state.borrow().handshake_complete;
+                if handshake_complete {
+                    let mut app_data = Vec::new();
+                    {
+                        let mut state = transport.state.borrow_mut();
+                        let tls_conn = state.tls_conn.as_mut().unwrap();
+
+                        let mut temp_buf = [0u8; 4096];
+                        loop {
+                            match tls_conn.reader().read(&mut temp_buf) {
+                                Ok(0) => break,
+                                Ok(n) => app_data.extend_from_slice(&temp_buf[..n]),
+                                Err(_) => break,
+                            }
+                        }
+                    }
+
+                    if !app_data.is_empty() {
+                        let pydata = PyBytes::new(py, &app_data);
+                        return (Some(pydata.into_any().unbind()), false);
+                    }
+                }
+            }
+
+            // Check if connection is closed
+            let closed = {
+                let mut state = transport.state.borrow_mut();
+                let (_, closed) = self.read_into(&mut state.stream, &mut []);
+                closed
+            };
+            return (None, closed);
+        }
+
+        // Non-TLS connection
+        let mut state = transport.state.borrow_mut();
+        let (read, closed) = self.read_into(&mut state.stream, buf);
         if read > 0 {
             let rbuf = &buf[..read];
             let pydata = unsafe { PyBytes::from_ptr(py, rbuf.as_ptr(), read) };
@@ -657,8 +849,107 @@ impl TCPWriteHandle {
     fn write(&self, transport: &TCPTransport) -> Option<usize> {
         #[allow(clippy::cast_possible_wrap)]
         let fd = self.fd as i32;
-        let mut ret = 0;
+
+        // Check if this is a TLS connection first
+        let is_tls = transport.state.borrow().tls_conn.is_some();
+
+        if is_tls {
+            // Handle TLS connections
+            let mut tls_buf = Vec::new();
+            {
+                let mut state = transport.state.borrow_mut();
+                let tls_conn = state.tls_conn.as_mut().unwrap();
+
+                // First, handle any pending TLS writes (handshake or encrypted data)
+                if let Err(_) = tls_conn.write_tls(&mut tls_buf) {
+                    // TLS error
+                    return None;
+                }
+            }
+
+            if !tls_buf.is_empty() {
+                match syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len())) {
+                    Ok(written) if written as usize == tls_buf.len() => {
+                        // TLS data written successfully
+                    }
+                    Ok(_written) => {
+                        // Partial write - this is complex for TLS, just fail for now
+                        return None;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Would block - need to retry later
+                        return Some(0);
+                    }
+                    _ => return None,
+                }
+            }
+
+            // Check if handshake is complete
+            let handshake_complete = transport.state.borrow().handshake_complete;
+
+            if handshake_complete {
+                // Write data one by one to avoid borrowing conflicts
+                let mut ret = 0;
+                loop {
+                    let data = {
+                        let state = transport.state.borrow();
+                        state.write_buf.front().cloned()
+                    };
+
+                    if let Some(data) = data {
+                        {
+                            let mut state = transport.state.borrow_mut();
+                            let tls_conn = state.tls_conn.as_mut().unwrap();
+
+                            if let Err(_) = std::io::Write::write_all(&mut tls_conn.writer(), &data) {
+                                // TLS write error - put data back
+                                return None;
+                            }
+                        }
+
+                        {
+                            let mut state = transport.state.borrow_mut();
+                            state.write_buf.pop_front();
+                            state.write_buf_dsize -= data.len();
+                        }
+
+                        ret += data.len();
+                    } else {
+                        break;
+                    }
+                }
+
+                // Write any newly encrypted data
+                let mut tls_buf = Vec::new();
+                {
+                    let mut state = transport.state.borrow_mut();
+                    let tls_conn = state.tls_conn.as_mut().unwrap();
+                    if let Err(_) = tls_conn.write_tls(&mut tls_buf) {
+                        return None;
+                    }
+                }
+
+                if !tls_buf.is_empty() {
+                    match syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len())) {
+                        Ok(written) if written as usize == tls_buf.len() => {}
+                        Ok(_) => return None, // Partial write
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            return Some(ret);
+                        }
+                        _ => return None,
+                    }
+                }
+
+                return Some(ret);
+            } else {
+                // Handshake not complete, just wrote handshake data
+                return Some(0);
+            }
+        }
+
+        // Non-TLS connection
         let mut state = transport.state.borrow_mut();
+        let mut ret = 0;
         while let Some(data) = state.write_buf.pop_front() {
             match syscall!(write(fd, data.as_ptr().cast(), data.len())) {
                 Ok(written) if (written as usize) < data.len() => {
@@ -684,6 +975,18 @@ impl TCPWriteHandle {
         }
         state.write_buf_dsize -= ret;
         Some(ret)
+    }
+
+    #[inline]
+    fn has_pending_tls_data(&self, transport: &TCPTransport) -> bool {
+        if let Some(ref tls_conn) = transport.state.borrow().tls_conn {
+            match tls_conn {
+                TLSConnection::Server(conn) => conn.wants_write(),
+                TLSConnection::Client(conn) => conn.wants_write(),
+            }
+        } else {
+            false
+        }
     }
 }
 

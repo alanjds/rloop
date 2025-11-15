@@ -1182,6 +1182,29 @@ impl EventLoop {
         Ok((pytransport, proto))
     }
 
+    fn _tcp_conn_ssl(
+        pyself: Py<Self>,
+        py: Python,
+        sock: (i32, i32),
+        protocol_factory: Py<PyAny>,
+        ssl_context: Py<PyAny>,
+        server_hostname: String,
+    ) -> PyResult<(Py<TCPTransport>, Py<PyAny>)> {
+        let rself = pyself.get();
+        let transport = TCPTransport::from_py(py, &pyself, sock, protocol_factory);
+        let fd = transport.fd;
+
+        // Initialize TLS client connection
+        let ssl_config = crate::ssl::create_ssl_client_config_from_context(&ssl_context.bind(py))?;
+        transport.initialize_tls_client(ssl_config, server_hostname);
+
+        let pytransport = Py::new(py, transport)?;
+        let proto = TCPTransport::attach(&pytransport, py)?;
+        rself.tcp_transports.pin().insert(fd, pytransport.clone_ref(py));
+        rself.tcp_stream_add(fd, Interest::READABLE);
+        Ok((pytransport, proto))
+    }
+
     fn _tcp_server(
         pyself: Py<Self>,
         py: Python,
@@ -1193,6 +1216,24 @@ impl EventLoop {
         let mut servers = Vec::new();
         for (fd, family) in rsocks {
             servers.push(TCPServer::from_fd(fd, family, backlog, protocol_factory.clone_ref(py)));
+        }
+        let server = Server::tcp(pyself.clone_ref(py), socks, servers);
+        Py::new(py, server)
+    }
+
+    fn _tcp_server_ssl(
+        pyself: Py<Self>,
+        py: Python,
+        socks: Py<PyAny>,
+        rsocks: Vec<(i32, i32)>,
+        protocol_factory: Py<PyAny>,
+        backlog: i32,
+        ssl_context: Py<PyAny>,
+    ) -> PyResult<Py<Server>> {
+        let ssl_config = crate::ssl::create_ssl_config_from_context(&ssl_context.bind(py))?;
+        let mut servers = Vec::new();
+        for (fd, family) in rsocks {
+            servers.push(TCPServer::from_fd_ssl(fd, family, backlog, protocol_factory.clone_ref(py), ssl_config.clone()));
         }
         let server = Server::tcp(pyself.clone_ref(py), socks, servers);
         Py::new(py, server)

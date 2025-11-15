@@ -423,7 +423,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
         if ssl:
             logger.debug('Creating SSL connection')
-            transport, protocol = self._ssl_conn(rsock, protocol_factory, server_hostname, ssl)
+            transport, protocol = self._tcp_conn_ssl(rsock, protocol_factory, ssl, server_hostname)
         else:
             logger.debug('Creating TCP connection')
             transport, protocol = self._tcp_conn(rsock, protocol_factory)
@@ -574,7 +574,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
 
         if ssl:
             logger.debug('Creating SSL server')
-            server = Server(self._ssl_server(sockets, rsocks, protocol_factory, ssl, backlog))
+            server = Server(self._tcp_server_ssl(sockets, rsocks, protocol_factory, backlog, ssl))
         else:
             logger.debug('Creating TCP server')
             server = Server(self._tcp_server(sockets, rsocks, protocol_factory, backlog))
