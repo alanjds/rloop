@@ -258,7 +258,7 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context):
     # Use EventLoop for server, requests for client
     server_loop = evloop()
 
-    host = '127.0.0.1'
+    host = 'localhost'
     port = random.randint(10000, 20000)
 
     # Shared state
