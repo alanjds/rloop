@@ -141,7 +141,7 @@ def test_ssl_server(evloop, ssl_context, server_ssl_context):
 
     loop = evloop()
 
-    host = '127.0.0.1'
+    host = 'localhost'
     port = random.randint(10000, 20000)
 
     server_proto = SSLEchoServerProtocol()
@@ -347,8 +347,7 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context):
         logger.debug('[client] Request successful!')
     except Exception as e:
         logger.debug(f'[client] Request failed: {e}')
-        # For now, don't fail the test - this is a known compatibility issue
-        pytest.skip(f'Requests client failed to connect to rustls server: {e}')
+        raise
     finally:
         # Signal and wait server to stop
         logger.debug('[client] Signaling the server to stop')
@@ -476,11 +475,7 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context):
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
 def test_ssl_server_with_tlslite_client(evloop, server_ssl_context):
     """Test EventLoop SSL server with tlslite-ng pure Python SSL client."""
-
-    try:
-        from tlslite import TLSConnection
-    except ImportError:
-        pytest.skip('tlslite-ng not available')
+    from tlslite import TLSConnection
 
     # Use EventLoop for server, tlslite-ng for client
     server_loop = evloop()
