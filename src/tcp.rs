@@ -1132,9 +1132,10 @@ impl Handle for TCPWriteHandle {
         {
             let state = transport.state.borrow();
             if state.tls_close_sent && state.tls_conn.is_some() {
+                log::debug!("SSL close: already sent. Waiting a response with TCP open.");
                 if let Some(sent_time) = state.tls_close_sent_time {
                     let elapsed = sent_time.elapsed();
-                    if elapsed > std::time::Duration::from_millis(100) {
+                    if elapsed > std::time::Duration::from_millis(1000) {
                         log::debug!("SSL close: timeout waiting for peer's close alert ({}ms), closing connection", elapsed.as_millis());
                         // Force close the connection
                         drop(state);
