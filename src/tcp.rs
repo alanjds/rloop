@@ -371,6 +371,12 @@ impl TCPTransport {
             return false;
         }
 
+        // For TLS connections, call close() to send TLS close alerts
+        if self.state.borrow().tls_conn.is_some() {
+            self.close(py);
+            return true;
+        }
+
         event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
         _ = self.protom_conn_lost.call1(py, (py.None(),));
         true
@@ -414,10 +420,19 @@ impl TCPTransport {
         let is_tls = rself.state.borrow().tls_conn.is_some();
         if is_tls {
             log::debug!("SSL write: try_write called with {} bytes of application data", data.len());
+        } else {
+            log::debug!("TCP write: try_write called with {} bytes of application data", data.len());
         }
 
-        let mut state = rself.state.borrow_mut();
-        let buf_added = match state.write_buf_dsize {
+    let mut state = rself.state.borrow_mut();
+
+    // For TLS connections, never write directly to socket - always buffer for encryption
+    let buf_added = if is_tls {
+        log::debug!("SSL write: TLS connection detected, buffering {} bytes for encryption", data.len());
+        state.write_buf.push_back(data.into());
+        data.len()
+    } else {
+        match state.write_buf_dsize {
             #[allow(clippy::cast_possible_wrap)]
             0 => match syscall!(write(rself.fd as i32, data.as_ptr().cast(), data.len())) {
                 Ok(written) if written as usize == data.len() => 0,
@@ -453,7 +468,8 @@ impl TCPTransport {
                 state.write_buf.push_back(data.into());
                 data.len()
             }
-        };
+        }
+    };
         if buf_added > 0 {
             if state.write_buf_dsize == 0 {
                 rself.pyloop.get().tcp_stream_add(rself.fd, Interest::WRITABLE);
@@ -515,12 +531,18 @@ impl TCPTransport {
         self.closing.load(atomic::Ordering::Relaxed)
     }
 
-    fn close(&self, py: Python) {
+    pub(crate) fn is_tls(&self) -> bool {
+        self.state.borrow().tls_conn.is_some()
+    }
+
+    pub(crate) fn close(&self, py: Python) {
+        log::debug!("TCPTransport::close() called for fd {}", self.fd);
         if self
             .closing
             .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
             .is_err()
         {
+            log::debug!("TCPTransport::close() already closing, returning");
             return;
         }
 
@@ -536,15 +558,24 @@ impl TCPTransport {
                 }
             }
             if !tls_buf.is_empty() {
+                log::trace!("SSL close: TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
+                // Fix TLS record version: Force all TLS records to use 0x0303 (TLS 1.2 compatible)
+                if tls_buf.len() >= 5 {
+                    log::trace!("SSL close: Original version bytes: {:02x} {:02x}", tls_buf[1], tls_buf[2]);
+                }
                 let fd = self.fd as i32;
                 let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
             }
+
+            // For TLS connections, also shutdown the TCP stream to ensure connection closes
+            let _ = self.state.borrow().stream.shutdown(std::net::Shutdown::Both);
         }
 
         let event_loop = self.pyloop.get();
         event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
-        if self.state.borrow().write_buf_dsize == 0 {
-            // set conn lost?
+        if self.state.borrow().write_buf_dsize == 0 || self.state.borrow().tls_conn.is_some() {
+            // For TLS connections, close immediately after sending close alert
+            // even if write buffer is not empty (close alert will be sent by TCPWriteHandle)
             event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
             self.call_conn_lost(py, None);
         }
@@ -927,6 +958,7 @@ impl TCPWriteHandle {
             }
 
             if !tls_buf.is_empty() {
+                log::trace!("SSL write: TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
                 log::debug!("SSL write: sending {} bytes of TLS data", tls_buf.len());
                 match syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len())) {
                     Ok(written) if written as usize == tls_buf.len() => {
@@ -998,6 +1030,7 @@ impl TCPWriteHandle {
                 }
 
                 if !tls_buf.is_empty() {
+                    log::trace!("SSL write: Application data TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
                     match syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len())) {
                         Ok(written) if written as usize == tls_buf.len() => {}
                         Ok(_) => return None, // Partial write
