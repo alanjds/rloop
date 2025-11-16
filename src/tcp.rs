@@ -221,6 +221,8 @@ struct TCPTransportState {
     connection_made_called: bool,
     write_buf: VecDeque<Box<[u8]>>,
     write_buf_dsize: usize,
+    tls_close_sent: bool,
+    tls_close_sent_time: Option<std::time::Instant>,
 }
 
 #[pyclass(frozen, unsendable, module = "rloop._rloop")]
@@ -264,6 +266,8 @@ impl TCPTransport {
             connection_made_called: false,
             write_buf: VecDeque::new(),
             write_buf_dsize: 0,
+            tls_close_sent: false,
+            tls_close_sent_time: None,
         };
 
         let wh = 1024 * 64;
@@ -555,6 +559,9 @@ impl TCPTransport {
                 let mut state = self.state.borrow_mut();
                 if let Some(ref mut tls_conn) = state.tls_conn {
                     let _ = tls_conn.write_tls(&mut tls_buf);
+                    // Mark that we've sent our close alert
+                    state.tls_close_sent = true;
+                    state.tls_close_sent_time = Some(std::time::Instant::now());
                 }
             }
             if !tls_buf.is_empty() {
@@ -567,8 +574,14 @@ impl TCPTransport {
                 let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
             }
 
-            // For TLS connections, don't shutdown TCP stream immediately
-            // Let the TLS close alert be sent first, and handle client response
+            // For TLS connections, close immediately after sending close alert
+            // This is not perfect TLS close handshake, but works for most clients
+            log::debug!("SSL close: closing connection immediately after sending close alert");
+            let event_loop = self.pyloop.get();
+            event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
+            event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
+            self.call_conn_lost(py, None);
+            return;
         }
 
         let event_loop = self.pyloop.get();
@@ -759,7 +772,16 @@ impl TCPReadHandle {
                             // Check if we received a close alert from the peer
                             if io_state.peer_has_closed() {
                                 log::debug!("SSL read: peer has closed the connection (received close alert)");
-                                return (None, true);
+                                // If we've sent our close alert and received the peer's, close the connection
+                                if state.tls_close_sent {
+                                    log::debug!("SSL read: TLS close handshake complete, closing connection");
+                                    return (None, true);
+                                } else {
+                                    log::debug!("SSL read: received peer close alert but we haven't sent ours yet");
+                                    // We should send our close alert in response
+                                    // This will be handled by the write path
+                                    transport.pyloop.get().tcp_stream_add(transport.fd, Interest::WRITABLE);
+                                }
                             }
                         }
                         Err(e) => {
@@ -1105,6 +1127,25 @@ impl Handle for TCPWriteHandle {
         let pytransport = event_loop.get_tcp_transport(self.fd, py);
         let transport = pytransport.borrow(py);
         let stream_close;
+
+        // Check if we need to timeout waiting for peer's close alert
+        {
+            let state = transport.state.borrow();
+            if state.tls_close_sent && state.tls_conn.is_some() {
+                if let Some(sent_time) = state.tls_close_sent_time {
+                    let elapsed = sent_time.elapsed();
+                    if elapsed > std::time::Duration::from_millis(100) {
+                        log::debug!("SSL close: timeout waiting for peer's close alert ({}ms), closing connection", elapsed.as_millis());
+                        // Force close the connection
+                        drop(state);
+                        event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
+                        event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
+                        transport.call_conn_lost(py, None);
+                        return;
+                    }
+                }
+            }
+        }
 
         if let Some(written) = self.write(&transport) {
             if written > 0 {
