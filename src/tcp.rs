@@ -567,8 +567,8 @@ impl TCPTransport {
                 let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
             }
 
-            // For TLS connections, also shutdown the TCP stream to ensure connection closes
-            let _ = self.state.borrow().stream.shutdown(std::net::Shutdown::Both);
+            // For TLS connections, don't shutdown TCP stream immediately
+            // Let the TLS close alert be sent first, and handle client response
         }
 
         let event_loop = self.pyloop.get();
@@ -754,10 +754,19 @@ impl TCPReadHandle {
                     }
 
                     // Process the new packets
-                    if let Err(e) = tls_conn.process_new_packets() {
-                        log::debug!("SSL read: TLS process_new_packets error: {:?}", e);
-                        // TLS error - close connection
-                        return (None, true);
+                    match tls_conn.process_new_packets() {
+                        Ok(io_state) => {
+                            // Check if we received a close alert from the peer
+                            if io_state.peer_has_closed() {
+                                log::debug!("SSL read: peer has closed the connection (received close alert)");
+                                return (None, true);
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("SSL read: TLS process_new_packets error: {:?}", e);
+                            // TLS error - close connection
+                            return (None, true);
+                        }
                     }
                 }
 
