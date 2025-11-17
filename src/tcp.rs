@@ -1022,10 +1022,8 @@ impl Handle for TCPReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
         let pytransport = match event_loop.get_tcp_transport(self.fd, py) {
             Some(t) => t,
-            None => {
-                // event_loop.tcp_stream_close(py, self.fd);
-                return  // Transport was closed
-            },
+            None => return,  // Transport was closed
+
         };
         let transport = pytransport.borrow(py);
 
@@ -1226,7 +1224,7 @@ impl Handle for TCPWriteHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
         let pytransport = match event_loop.get_tcp_transport(self.fd, py) {
             Some(t) => t,
-            None => return, // Transport was closed
+            None => return,  // Transport was closed
         };
         let transport = pytransport.borrow(py);
         let stream_close;
