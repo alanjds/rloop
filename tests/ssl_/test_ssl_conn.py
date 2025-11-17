@@ -462,8 +462,6 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
 
         logger.debug('proc.returncode = %s', proc.returncode)
         logger.debug(f"'hello SSL world' in stdout = {'hello SSL world' in stdout}")
-        logger.debug(f'stdout contains: {repr(stdout)}')
-        logger.debug(f'stderr contains: {repr(stderr)}')
 
         # Check if connection was successful and response contains expected content
         if proc.returncode == 0 and 'hello SSL world' in stdout:
