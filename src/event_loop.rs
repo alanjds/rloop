@@ -344,8 +344,7 @@ impl EventLoop {
                         let guard_poll = self.io.lock().unwrap();
                         _ = guard_poll.registry().reregister(&mut source, token, interests);
                     }
-                    // Wake the event loop since interest changed
-                    self.wake();
+                    self.wake();  // interest changed
                     return IOHandle::TCPStream(interests);
                 }
                 unreachable!()
@@ -357,8 +356,7 @@ impl EventLoop {
                     let guard_poll = self.io.lock().unwrap();
                     _ = guard_poll.registry().register(&mut source, token, interest);
                 }
-                // Wake the event loop since new interest registered
-                self.wake();
+                self.wake();  // interest registered
                 IOHandle::TCPStream(interest)
             },
         );
