@@ -779,26 +779,11 @@ impl TCPReadHandle {
                             // Check if we received a close alert from the peer
                             if io_state.peer_has_closed() {
                                 log::debug!("SSL read: peer has closed the connection (received close alert)");
+                                // FIX: Always close immediately when receiving close alert to prevent hanging
+                                // This handles both TLS 1.2 and TLS 1.3 properly
+                                log::debug!("SSL read: closing connection immediately to prevent hanging");
+                                tls_conn.send_close_notify();
                                 state.tls_close_received = true;
-
-                                // Send our close alert in response if we haven't already
-                                if !state.tls_close_sent {
-                                    log::debug!("SSL read: sending close alert in response to peer's close alert");
-                                    if let Some(ref mut tls_conn) = state.tls_conn {
-                                        tls_conn.send_close_notify();
-                                        let mut tls_buf = Vec::new();
-                                        let _ = tls_conn.write_tls(&mut tls_buf);
-                                        if !tls_buf.is_empty() {
-                                            let fd = transport.fd as i32;
-                                            let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
-                                        }
-                                        state.tls_close_sent = true;
-                                        state.tls_close_sent_time = Some(std::time::Instant::now());
-                                    }
-                                }
-
-                                // TLS close handshake is complete, close the connection
-                                log::debug!("SSL read: TLS close handshake complete, closing connection");
                                 return (None, true);
                             }
                         }
