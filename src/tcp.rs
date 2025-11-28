@@ -481,13 +481,16 @@ impl TCPTransport {
                         .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
                         .is_ok()
                     {
+                        log::debug!("TCP write (try_write): error on fd {}, setting closing and removing READ interest", rself.fd);
                         rself.pyloop.get().tcp_stream_rem(rself.fd, Interest::READABLE);
                     }
                     rself.call_conn_lost(py, Some(pyo3::exceptions::PyRuntimeError::new_err(err.to_string())));
+                    // Connection closed
                     0
                 }
             },
-            _ => {
+            _ => {  // Buffer already had data, append new data
+                log::debug!("SSL write (try_write): appending {} bytes to existing buffer on fd {}", data.len(), rself.fd);
                 state.write_buf.push_back(data.into());
                 data.len()
             }
@@ -513,6 +516,7 @@ impl TCPTransport {
 
     fn proto_pause(pyself: &Py<Self>, py: Python) {
         let rself = pyself.borrow(py);
+        log::debug!("TCP/SSL proto_pause called for fd {}", rself.fd); // Use rself.fd
         if let Err(err) = rself.proto.call_method0(py, pyo3::intern!(py, "pause_writing")) {
             let err_ctx = LogExc::transport(
                 err,
@@ -526,6 +530,7 @@ impl TCPTransport {
 
     fn proto_resume(pyself: &Py<Self>, py: Python) {
         let rself = pyself.borrow(py);
+         log::debug!("TCP/SSL proto_resume called for fd {}", rself.fd); // Use rself.fd
         if let Err(err) = rself.proto.call_method0(py, pyo3::intern!(py, "resume_writing")) {
             let err_ctx = LogExc::transport(
                 err,
@@ -684,6 +689,7 @@ impl TCPTransport {
         };
 
         if wh < wl {
+            log::error!("TCPTransport::set_write_buffer_limits for fd {}: Error: high ({}) must be >= low ({}). Current values not changed.", pyself.borrow(py).fd, wh, wl);
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "high must be >= low must be >= 0",
             ));
@@ -706,29 +712,38 @@ impl TCPTransport {
     }
 
     fn get_write_buffer_size(&self) -> usize {
-        self.state.borrow().write_buf_dsize
+        let size = self.state.borrow().write_buf_dsize;
+        log::debug!("TCPTransport::get_write_buffer_size called for fd {}. Size: {}", self.fd, size);
+        size
     }
 
     fn get_write_buffer_limits(&self) -> (usize, usize) {
-        (
+        let limits = (
             self.water_lo.load(atomic::Ordering::Relaxed),
             self.water_hi.load(atomic::Ordering::Relaxed),
-        )
+        );
+        log::debug!("TCPTransport::get_write_buffer_limits called for fd {}. Limits: {:?}", self.fd, limits);
+        limits
     }
 
     fn write(pyself: Py<Self>, py: Python, data: Cow<[u8]>) -> PyResult<()> {
+        log::debug!("TCPTransport::write (PyO3) called for fd {:?} with {} bytes", pyself.borrow(py).fd, data.len());
         Self::try_write(&pyself, py, &data)
     }
 
     fn writelines(pyself: Py<Self>, py: Python, data: &Bound<PyAny>) -> PyResult<()> {
+        log::debug!("TCPTransport::writelines (PyO3) called for fd {:?}", pyself.borrow(py).fd);
         let pybytes = PyBytes::new(py, &[0; 0]);
         let pybytesj = pybytes.call_method1(pyo3::intern!(py, "join"), (data,))?;
-        let bytes = pybytesj.extract::<Cow<[u8]>>()?;
+        let bytes: Cow<[u8]> = pybytesj.extract().unwrap(); // Assume extraction succeeds
+        log::debug!("TCPTransport::writelines (PyO3) for fd {:?} joined to {} bytes", pyself.borrow(py).fd, bytes.len());
         Self::try_write(&pyself, py, &bytes)
     }
 
     fn write_eof(&self) {
+        log::debug!("TCPTransport::write_eof called for fd {}", self.fd);
         if self.closing.load(atomic::Ordering::Relaxed) {
+            log::debug!("TCPTransport::write_eof: fd {} closing, returning.", self.fd);
             return;
         }
         if self
