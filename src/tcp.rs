@@ -746,6 +746,7 @@ impl TCPTransport {
             log::debug!("TCPTransport::write_eof: fd {} closing, returning.", self.fd);
             return;
         }
+        // weof -> write end of file: no more writes will be done.
         if self
             .weof
             .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
@@ -761,11 +762,15 @@ impl TCPTransport {
     }
 
     fn can_write_eof(&self) -> bool {
-        true
+        let can = !self.weof.load(atomic::Ordering::Relaxed);  // Can write EOF if not already set
+        log::debug!("TCPTransport::can_write_eof called for fd {}. Value: {}", self.fd, can);
+        can
     }
 
     fn abort(&self, py: Python) {
+        log::debug!("TCPTransport::abort called for fd {}", self.fd);
         if self.state.borrow().write_buf_dsize > 0 {
+            log::debug!("TCPTransport::abort: fd {} has write_buf_dsize > 0. Removing WRITABLE interest.", self.fd);
             self.pyloop.get().tcp_stream_rem(self.fd, Interest::WRITABLE);
         }
         if self
@@ -773,13 +778,18 @@ impl TCPTransport {
             .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
             .is_ok()
         {
+            log::debug!("TCPTransport::abort: fd {} set closing. Removing READ interest.", self.fd);
             self.pyloop.get().tcp_stream_rem(self.fd, Interest::READABLE);
+        } else {
+            log::debug!("TCPTransport::abort: fd {} was already closing.", self.fd);
         }
+        log::debug!("TCPTransport::abort: fd {} calling call_conn_lost due to abort.", self.fd);
         self.call_conn_lost(py, None);
     }
 
     fn call_connection_lost(&self, py: Python) {
         self.call_conn_lost_py(py);
+        log::debug!("TCPTransport::call_connection_lost (Python API) called for fd {}", self.fd);
     }
 }
 
