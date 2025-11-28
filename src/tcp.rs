@@ -405,11 +405,11 @@ impl TCPTransport {
 
     #[inline(always)]
     fn call_conn_lost(&self, py: Python, err: Option<PyErr>) {
+        log::debug!("TCPTransport::call_conn_lost called for fd {}. Error present: {:?}", self.fd, err.is_some());
         let err_arg = match err {
             Some(e) => e.into_py_any(py).unwrap(),
             None => py.None(),
         };
-        log::debug!("TCPTransport::call_conn_lost called for fd {}. Error present: {:?}", self.fd, err.is_some());
         _ = self.protom_conn_lost.call1(py, (err_arg,));
         // tcp_stream_close will trigger actual socket closure and subsequent Python callback
         self.pyloop.get().tcp_stream_close(py, self.fd);
