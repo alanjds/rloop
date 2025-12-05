@@ -271,7 +271,7 @@ def test_cross_implementation_server_client(
             except Exception as e:
                 logger.debug(f'[client [{i}]] {client_loop_name} client failed: {e}')
 
-    server_thread, server_stop, (host, port) = start_ssl_http_server(
+    server_process, server_stop, (host, port) = start_ssl_http_server(
         server_loop, server_ssl_context, protocol=SSLEchoServerProtocol
     )
 
@@ -282,7 +282,7 @@ def test_cross_implementation_server_client(
     # Signal and wait server to stop
     logger.debug('[test] Signaling the server to stop')
     server_stop.set()
-    server_thread.join(timeout=3)
+    server_process.join(timeout=3)
 
     # Check results
     logger.debug(f'[test] Client state: {client_proto.state}')
@@ -306,7 +306,7 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context, tls_version
     # Use EventLoop for server, raw SSL socket for client
     server_loop = evloop()
 
-    server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
+    server_process, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
 
     url = f'https://{host}:{port}'
     # Create raw SSL client
@@ -320,7 +320,7 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context, tls_version
     # Signal and wait server to stop
     logger.debug('[client] Signaling the server to stop')
     server_stop.set()
-    server_thread.join(timeout=3)
+    server_process.join(timeout=3)
 
 
 @pytest.mark.timeout(10)
@@ -335,7 +335,7 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version,
     # Use EventLoop for server, raw SSL socket for client
     server_loop = evloop()
 
-    server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
+    server_process, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
 
     # Create raw SSL client
     logger.debug(f'[client] Connecting to {host}:{port} via raw SSL socket')
@@ -400,7 +400,7 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version,
     # Signal and wait server to stop
     logger.debug('[client] Signaling the server to stop')
     server_stop.set()
-    server_thread.join(timeout=3)
+    server_process.join(timeout=3)
 
     assert success, 'Raw SSL client test failed'
 
@@ -420,7 +420,7 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version,
     server_loop = evloop()
 
     logger.debug('Starting SSL HTTP server')
-    server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
+    server_process, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
     logger.debug(f'Server started on {host}:{port}')
 
     # Create openssl s_client command with handshake debugging
@@ -494,6 +494,6 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version,
     # Signal and wait server to stop
     logger.debug('[client] Signaling the server to stop')
     server_stop.set()
-    server_thread.join(timeout=5)
+    server_process.join(timeout=5)
 
     assert success, 'openssl s_client test failed'
